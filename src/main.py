@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import logging
 from typing import List
+from dotenv import load_dotenv
 
+from pathlib import Path
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from ufc import get_ufc_events
 from pfl import get_pfl_events
 from calendar_builder import build_calendar

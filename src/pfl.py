@@ -1,16 +1,28 @@
 """PFL event provider.
 
 Fetches upcoming events from the official PFL website and converts them
-into `FightEvent` instances. Uses JSON-LD when present and falls back to
-simple HTML heuristics.
+into ``FightEvent`` instances.
+
+Strategy
+--------
+1. Fetch ``pflmma.com/events`` listing.
+2. Find all ``event-card-info`` containers -- each one corresponds to a single
+   event card in the listing grid.
+3. For every card, extract the preliminary date and card-timing lines
+   (e.g. "5pm ET Early Card | 8pm ET Main Card") directly from the listing.
+4. Skip cards that show "VIEW RESULTS" (past events).
+5. Visit only the individual event pages that are candidates for being future
+   events, collect the clean official title and confirm the date via H2.
+6. Skip past events, deduplicate, return sorted results.
 """
 from __future__ import annotations
 
-from typing import List, Optional
-from urllib.parse import urljoin
+from typing import Dict, List, Optional
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 import logging
 import re
-from datetime import date, datetime
 
 from dateutil import parser as date_parser
 
@@ -20,372 +32,502 @@ from timezone import to_riyadh, RIYADH
 
 logger = logging.getLogger(__name__)
 
+BASE = "https://pflmma.com"
 
-BASE = "https://www.pflmma.com"
+# Timezone abbreviation to IANA name mapping for card-time parsing.
+_TZ_MAP: Dict[str, str] = {
+    "ET": "America/New_York",
+    "EDT": "America/New_York",
+    "EST": "America/New_York",
+    "CT": "America/Chicago",
+    "CDT": "America/Chicago",
+    "CST": "America/Chicago",
+    "MT": "America/Denver",
+    "MDT": "America/Denver",
+    "MST": "America/Denver",
+    "PT": "America/Los_Angeles",
+    "PDT": "America/Los_Angeles",
+    "PST": "America/Los_Angeles",
+    "SAST": "Africa/Johannesburg",
+    "GMT": "UTC",
+    "UTC": "UTC",
+}
 
+# Tokens that indicate navigation / marketing -- never use as event titles.
+_JUNK_TOKENS = frozenset(
+    w.lower()
+    for w in (
+        "buy tickets", "buy now", "tickets", "matchups", "bout sheet",
+        "event info", "view results", "register", "watch live", "watch now",
+        "live", "previous", "next", "follow live", "vip experiences",
+        "how to watch", "register your interest", "performance solutions",
+    )
+)
+
+
+# ---- helpers ----------------------------------------------------------------
 
 def _canonical_url(url: str) -> str:
-	from urllib.parse import urlsplit, urlunsplit
-	sp = urlsplit(url)
-	return urlunsplit((sp.scheme, sp.netloc, sp.path.rstrip('/'), '', ''))
+    sp = urlsplit(url)
+    return urlunsplit((sp.scheme, sp.netloc, sp.path.rstrip("/"), "", ""))
 
 
-def _parse_jsonld_event(obj: dict) -> Optional[FightEvent]:
-	typ = obj.get("@type") or obj.get("type")
-	if not typ:
-		return None
-
-	if isinstance(typ, list):
-		ok = any(t in ("SportsEvent", "Event") for t in typ)
-	else:
-		ok = typ in ("SportsEvent", "Event")
-
-	if not ok:
-		return None
-
-	name = obj.get("name")
-	url = obj.get("url")
-	start = obj.get("startDate")
-
-	venue_name = None
-	loc = obj.get("location") or {}
-	if isinstance(loc, dict):
-		venue_name = loc.get("name")
-
-	early = None
-	prelims = None
-	maincard = None
-
-	for sub in obj.get("subEvent") or []:
-		try:
-			sname = sub.get("name", "").lower()
-			sstart = sub.get("startDate")
-			if sstart:
-				dt = date_parser.parse(sstart)
-			else:
-				dt = None
-
-			if "early" in sname or "early prelim" in sname:
-				early = dt
-			elif "prelim" in sname and "main" not in sname:
-				prelims = dt
-			elif "main" in sname or "main card" in sname:
-				maincard = dt
-		except Exception:
-			continue
-
-	if maincard is None and start:
-		try:
-			maincard = date_parser.parse(start)
-		except Exception:
-			maincard = None
-
-	parsed_date = None
-	if start:
-		try:
-			dt = date_parser.parse(start)
-			parsed_date = dt.date()
-		except Exception:
-			parsed_date = None
-
-	fe = FightEvent(
-		organization="PFL",
-		event_name=name or "PFL Event",
-		slug=(url or "").rstrip("/"),
-		main_event=None,
-		location=venue_name,
-		event_date=parsed_date,
-		early_prelims=to_riyadh(early) if early else None,
-		prelims=to_riyadh(prelims) if prelims else None,
-		main_card=to_riyadh(maincard) if maincard else None,
-		source_url=urljoin(BASE, url) if url else None,
-	)
-
-	return fe
+def _is_pflmma_event_link(href: str) -> bool:
+    """Return True if href is a pflmma.com single-event page link."""
+    if not href:
+        return False
+    if href.startswith("/event/"):
+        return True
+    return "pflmma.com/event/" in href
 
 
-def _parse_date_text(text: str) -> Optional[date]:
-	if not text:
-		return None
-	text = re.sub(r"\s+", " ", text).strip()
-	if not text:
-		return None
-
-	patterns = [
-		r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s*\d{4}\b",
-		r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\b",
-		r"\b\d{4}-\d{2}-\d{2}\b",
-		r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+[A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?\b",
-	]
-	for pattern in patterns:
-		match = re.search(pattern, text, flags=re.IGNORECASE)
-		if match:
-			try:
-				dt = date_parser.parse(match.group(0))
-				return dt.date()
-			except Exception:
-				continue
-
-	if not re.search(r"\b20\d{2}\b", text):
-		return None
-
-	try:
-		dt = date_parser.parse(text, fuzzy=True)
-		return dt.date()
-	except Exception:
-		return None
+def _normalize(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    return cleaned or None
 
 
-def _extract_event_date(soup) -> Optional[date]:
-	for time_tag in soup.find_all("time"):
-		if time_tag.has_attr("datetime"):
-			try:
-				dt = date_parser.parse(time_tag["datetime"])
-				return dt.date()
-			except Exception:
-				continue
+def _strip_org_suffix(title: str) -> str:
+    """Remove trailing org name variants, e.g. '| Professional Fighters League'."""
+    # Use explicit pipe or dash characters, not a character range
+    title = re.sub(
+        r"\s*(?:[|]|[-]|[--])\s*Professional\s+Fighters\s+League\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Also strip trailing "| PFL" or "- PFL"
+    title = re.sub(
+        r"\s*[|]\s*PFL\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+    return title
 
-	meta_attrs = [
-		{"property": "og:description"},
-		{"property": "og:title"},
-		{"name": "description"},
-		{"name": "twitter:description"},
-		{"name": "twitter:title"},
-	]
-	for attrs in meta_attrs:
-		meta = soup.find("meta", attrs=attrs)
-		if meta and meta.get("content"):
-			dt = _parse_date_text(meta["content"])
-			if dt:
-				return dt
 
-	text = soup.get_text(" ", strip=True)
-	return _parse_date_text(text)
+def _is_junk_title(text: Optional[str]) -> bool:
+    if not text:
+        return True
+    low = text.strip().lower()
+    if not low:
+        return True
+    return low in _JUNK_TOKENS
 
+
+def _clean_title(raw: Optional[str]) -> Optional[str]:
+    """Strip org suffixes and junk tokens; return None if nothing usable remains."""
+    if not raw:
+        return None
+    text = _strip_org_suffix(_normalize(raw) or "")
+    if not text:
+        return None
+    # Remove junk tokens from the end / middle
+    for token in sorted(_JUNK_TOKENS, key=len, reverse=True):
+        text = re.sub(r"\b" + re.escape(token) + r"\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" |-")
+    if not text or _is_junk_title(text):
+        return None
+    return text
+
+
+# ---- date parsing -----------------------------------------------------------
+
+def _parse_yearless_date(month_str: str, day: int) -> Optional[date]:
+    """Infer the most-likely calendar year for a month+day combination.
+
+    Uses the current Riyadh date as reference; picks the nearest upcoming
+    occurrence (current year preferred; next year used only if the candidate
+    falls more than 7 days in the past).
+    """
+    today = datetime.now(RIYADH).date()
+    for year in (today.year, today.year + 1):
+        try:
+            d = date_parser.parse(f"{month_str} {day} {year}").date()
+            if d >= today - timedelta(days=7):
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def _parse_listing_date(text: str) -> Optional[date]:
+    """Parse a date in the form 'Fri, Jul 10' from listing card text."""
+    m = re.search(
+        r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+"
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    return _parse_yearless_date(m.group(1), int(m.group(2)))
+
+
+def _parse_h2_date(h2_text: str) -> Optional[date]:
+    """Parse a date from an H2 like 'PFL AUSTIN 2026 | SAT JUL 18'."""
+    # Try pipe-separated format first
+    m = re.search(
+        r"[|]\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b",
+        h2_text,
+        re.IGNORECASE,
+    )
+    if not m:
+        # Standalone "FRI JUL 10" without pipe
+        m = re.search(
+            r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b",
+            h2_text,
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+    return _parse_yearless_date(m.group(1), int(m.group(2)))
+
+
+def _parse_full_date(text: str) -> Optional[date]:
+    """Parse any date with an explicit 4-digit year in text."""
+    patterns = [
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s*\d{4}\b",
+        r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\b",
+    ]
+    for pattern in patterns:
+        m_obj = re.search(pattern, text, flags=re.IGNORECASE)
+        if m_obj:
+            try:
+                return date_parser.parse(m_obj.group(0)).date()
+            except Exception:
+                continue
+    return None
+
+
+# ---- card-time parsing ------------------------------------------------------
+
+_CARD_TIME_RE = re.compile(
+    r"(\d{1,2}(?::\d{2})?\s*(?:am|pm))\s+([A-Z]{2,4})\s+"
+    r"(Early\s+Card|Early\s+Prelims?|Prelims?|Main\s+Card)",
+    re.IGNORECASE,
+)
+
+
+def _parse_card_times(
+    text: str, event_date: Optional[date]
+) -> Dict[str, Optional[datetime]]:
+    """Extract early-prelims / prelims / main-card datetimes from listing text.
+
+    Parses patterns like "5pm ET Early Card | 8pm ET Main Card".
+    All results are converted to Asia/Riyadh.
+    """
+    result: Dict[str, Optional[datetime]] = {
+        "early_prelims": None,
+        "prelims": None,
+        "main_card": None,
+    }
+    if event_date is None:
+        return result
+
+    for m in _CARD_TIME_RE.finditer(text):
+        time_str = m.group(1).strip()
+        tz_abbrev = m.group(2).upper()
+        label = m.group(3).lower().replace(" ", "_")
+
+        tz_name = _TZ_MAP.get(tz_abbrev)
+        if not tz_name:
+            logger.debug("Unknown TZ abbreviation %r in PFL listing", tz_abbrev)
+            continue
+
+        tz = ZoneInfo(tz_name)
+        try:
+            t = date_parser.parse(time_str).time()
+            local_dt = datetime.combine(event_date, t, tzinfo=tz)
+            riyadh_dt = local_dt.astimezone(RIYADH)
+        except Exception as exc:
+            logger.debug("Could not parse card time %r: %s", time_str, exc)
+            continue
+
+        if "early" in label:
+            result["early_prelims"] = riyadh_dt
+        elif "prelim" in label and "early" not in label:
+            result["prelims"] = riyadh_dt
+        elif "main" in label:
+            result["main_card"] = riyadh_dt
+
+    return result
+
+
+# ---- per-event page scraping ------------------------------------------------
+
+def _extract_event_title(soup) -> Optional[str]:
+    """Best-effort title extraction from an individual event page."""
+    # 1. OG title (most reliable -- already includes event name)
+    meta = soup.find("meta", attrs={"property": "og:title"})
+    if meta and meta.get("content"):
+        t = _clean_title(meta["content"])
+        if t:
+            return t
+
+    # 2. JSON-LD name
+    for obj in extract_json_ld(soup):
+        name = obj.get("name")
+        if isinstance(name, str):
+            t = _clean_title(name)
+            if t:
+                return t
+
+    # 3. First H2 that starts with "PFL" and has no pipe (not a date-annotated heading)
+    for h in soup.find_all("h2"):
+        text = h.get_text(" ", strip=True)
+        if "|" in text:
+            continue
+        t = _clean_title(text)
+        if t and re.match(r"^pfl\b", t, re.IGNORECASE):
+            return t
+
+    return None
+
+
+def _extract_event_date_from_page(soup) -> Optional[date]:
+    """Extract the event date from an individual event page."""
+    # <time datetime="..."> tags
+    for tag in soup.find_all("time"):
+        raw = tag.get("datetime", "")
+        if raw:
+            try:
+                return date_parser.parse(raw).date()
+            except Exception:
+                pass
+
+    # JSON-LD startDate
+    for obj in extract_json_ld(soup):
+        sd = obj.get("startDate")
+        if isinstance(sd, str):
+            try:
+                return date_parser.parse(sd).date()
+            except Exception:
+                pass
+
+    # H2 with "| DAY MON DD" format
+    for h in soup.find_all("h2"):
+        text = h.get_text(" ", strip=True)
+        d = _parse_h2_date(text)
+        if d:
+            return d
+
+    # Full date with 4-digit year anywhere on page
+    text = soup.get_text(" ", strip=True)
+    return _parse_full_date(text)
+
+
+def _extract_location_from_page(soup) -> Optional[str]:
+    """Extract venue/location from an event page."""
+    for obj in extract_json_ld(soup):
+        loc = obj.get("location")
+        if isinstance(loc, dict):
+            name = loc.get("name")
+            addr = loc.get("address") or {}
+            locality = addr.get("addressLocality") if isinstance(addr, dict) else None
+            parts = [p for p in (name, locality) if isinstance(p, str) and p.strip()]
+            if parts:
+                return ", ".join(dict.fromkeys(parts))
+    return None
+
+
+_VS_RE = re.compile(
+    r"([A-Z][A-Za-z'.\- ]{2,40}?)\s+vs\.?\s+([A-Z][A-Za-z'.\- ]{2,40})",
+    re.IGNORECASE,
+)
+_JUNK_SUFFIX_RE = re.compile(
+    r"\s*(?:official|promo|video|highlights|watch|tickets|buy|matchups)\b.*",
+    re.IGNORECASE,
+)
+
+
+def _extract_main_event_from_page(soup) -> Optional[str]:
+    """Find the headliner 'Fighter A vs Fighter B' matchup on an event page."""
+
+    def _try_match(text: str) -> Optional[str]:
+        text = _JUNK_SUFFIX_RE.sub("", text).strip()
+        m = _VS_RE.search(text)
+        if not m:
+            return None
+        left = m.group(1).strip()
+        right = m.group(2).strip()
+        if (
+            left and right
+            and not _is_junk_title(left)
+            and not _is_junk_title(right)
+            and len(left) > 2
+            and len(right) > 2
+        ):
+            return f"{left} vs {right}"
+        return None
+
+    # Strategy 1: H2/H3/H4/strong/b tags without pipes (not event title headings)
+    for tag in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
+        raw = tag.get_text(" ", strip=True)
+        if "|" in raw:
+            continue
+        if " vs " not in raw.lower():
+            continue
+        result = _try_match(raw)
+        if result:
+            return result
+
+    # Strategy 2: p/a tags -- PFL uses "EVENT NAME - Fighter A vs Fighter B | Event Name"
+    # First strip " | Event Name" suffix, then strip "EVENT NAME - " prefix, then extract.
+    for tag in soup.find_all(["p", "a"]):
+        raw = tag.get_text(" ", strip=True)
+        if " vs " not in raw.lower():
+            continue
+        # Take text before the first "|" (removes event name suffix)
+        text = raw.split("|")[0].strip()
+        # If the text contains " - ", take everything after the last " - " to remove
+        # event-name prefixes like "PFL AUSTIN - "
+        if " - " in text:
+            text = text.rsplit(" - ", 1)[-1].strip()
+        result = _try_match(text)
+        if result:
+            return result
+
+    return None
+
+
+# ---- listing-page parsing ---------------------------------------------------
+
+def _parse_listing_cards(soup) -> List[Dict]:
+    """Parse ``event-card-info`` containers from the listing page.
+
+    Only returns UPCOMING events (cards with MATCHUPS / EVENT DETAILS buttons,
+    NOT cards with VIEW RESULTS which indicate past events).
+
+    Returns a list of dicts with keys: url, date, card_text.
+    """
+    cards: List[Dict] = []
+    seen_urls: set = set()
+
+    for card_div in soup.find_all("div", class_=lambda c: c and "event-card-info" in c):
+        card_text = card_div.get_text(" ", strip=True)
+
+        # Skip past events -- they show a "VIEW RESULTS" button.
+        if re.search(r"\bview\s+results\b", card_text, re.IGNORECASE):
+            continue
+
+        # Find the primary /event/ link in this card
+        event_url = None
+        for a in card_div.find_all("a", href=True):
+            href = a["href"]
+            if _is_pflmma_event_link(href):
+                full = urljoin(BASE, href) if href.startswith("/") else href
+                event_url = _canonical_url(full)
+                break
+
+        if not event_url or event_url in seen_urls:
+            continue
+        seen_urls.add(event_url)
+
+        event_date = _parse_listing_date(card_text)
+        cards.append({"url": event_url, "date": event_date, "card_text": card_text})
+
+    return cards
+
+
+# ---- future-event filter ----------------------------------------------------
 
 def _is_future_event(event: FightEvent) -> bool:
-	today = datetime.now(RIYADH).date()
-	if event.event_date is not None:
-		return event.event_date >= today
-	for dt in (event.main_card, event.prelims, event.early_prelims):
-		if dt is not None and to_riyadh(dt).date() >= today:
-			return True
-	return False
+    today = datetime.now(RIYADH).date()
+    if event.event_date is not None:
+        return event.event_date >= today
+    for dt in (event.main_card, event.prelims, event.early_prelims):
+        if dt is not None and to_riyadh(dt).date() >= today:
+            return True
+    return False
 
 
-def _find_event_listing_container(anchor):
-	for ancestor in anchor.parents:
-		if not hasattr(ancestor, "get_text"):
-			continue
-		classes = ancestor.get("class") or []
-		if any(isinstance(c, str) and c.lower().startswith("event") for c in classes):
-			return ancestor
-		text = ancestor.get_text(" ", strip=True)
-		if len(text) > 80 and re.search(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+[A-Za-z]{3,9}\s+\d{1,2}\b", text):
-			return ancestor
-	# fallback to the anchor's parent element
-	return anchor.parent
-
-
-def _extract_listing_title(text: str) -> str:
-	if not text:
-		return "PFL Event"
-	# Remove date prefixes and common action labels
-	text = re.sub(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+[A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?\b", "", text, flags=re.IGNORECASE).strip()
-	text = re.sub(r"\b(?:early card|main card|matchups|tickets|buy tickets|view results|learn more|register|learn more)\b.*", "", text, flags=re.IGNORECASE).strip()
-	return text or "PFL Event"
-
-
-def _normalize_pfl_text(text: Optional[str]) -> Optional[str]:
-	if not text:
-		return None
-	cleaned = re.sub(r"\s+", " ", text).strip()
-	return cleaned if cleaned else None
-
-
-def _is_invalid_pfl_title(text: Optional[str]) -> bool:
-	if not text:
-		return True
-	cleaned = _normalize_pfl_text(text)
-	if not cleaned:
-		return True
-	if re.fullmatch(r"(?i)(buy tickets|tickets|pfl event|register|watch live|live|previous|next)", cleaned):
-		return True
-	if re.search(r"\b(?:buy tickets|buy now|register|watch live|view tickets|watch now|live|previous|next)\b", cleaned, flags=re.IGNORECASE):
-		return True
-	return False
-
-
-def _clean_pfl_title(text: Optional[str]) -> Optional[str]:
-	cleaned = _normalize_pfl_text(text)
-	if not cleaned:
-		return None
-	# Split on common separators and evaluate each candidate separately.
-	parts = [re.sub(r"[\|•\-]", " ", part).strip() for part in re.split(r"[\|•\-]", cleaned)]
-	candidates = []
-	for part in parts:
-		if not part:
-			continue
-		part_clean = re.sub(r"\b(?:buy tickets|buy now|register|watch live|view tickets|watch now|live|previous|next)\b", "", part, flags=re.IGNORECASE)
-		part_clean = re.sub(r"\s+", " ", part_clean).strip()
-		if not part_clean:
-			continue
-		if _is_invalid_pfl_title(part_clean):
-			continue
-		candidates.append(part_clean)
-	if candidates:
-		for candidate in candidates:
-			if re.match(r"(?i)^pfl\b", candidate):
-				return candidate
-		return max(candidates, key=lambda c: len(c))
-
-	# If the full cleaned string is valid, use it.
-	if not _is_invalid_pfl_title(cleaned):
-		return cleaned
-	return None
-
-
-def _extract_pfl_title(soup) -> Optional[str]:
-	# Prefer JSON-LD name
-	jsonlds = extract_json_ld(soup)
-	for obj in jsonlds:
-		name = obj.get("name") if isinstance(obj.get("name"), str) else None
-		if name:
-			validated = _clean_pfl_title(name)
-			if validated:
-				return validated
-
-	# Prefer OG title
-	meta = soup.find("meta", attrs={"property": "og:title"})
-	if meta and meta.get("content"):
-		validated = _clean_pfl_title(meta["content"])
-		if validated:
-			return validated
-
-	# Prefer Twitter title
-	meta = soup.find("meta", attrs={"name": "twitter:title"})
-	if meta and meta.get("content"):
-		validated = _clean_pfl_title(meta["content"])
-		if validated:
-			return validated
-
-	# If page is on Webook, prefer heading over button text
-	if "webook.com" in (soup.find("meta", attrs={"property": "og:url"}) or {}).get("content", "").lower():
-		title_tag = soup.find("h1")
-		if title_tag:
-			title = title_tag.get_text(" ", strip=True)
-			validated = _clean_pfl_title(title)
-			if validated:
-				return validated
-
-	# Prefer H1
-	title_tag = soup.find("h1")
-	if title_tag:
-		title = title_tag.get_text(" ", strip=True)
-		validated = _clean_pfl_title(title)
-		if validated:
-			return validated
-
-	# Prefer title tag
-	title_tag = soup.find("title")
-	if title_tag and title_tag.string:
-		title = title_tag.string.strip()
-		validated = _clean_pfl_title(title)
-		if validated:
-			return validated
-
-	return None
-
-
-def _build_listing_fallback(listing):
-	fallbacks = {}
-	for a in listing.find_all("a", href=True):
-		href = a["href"]
-		if "/events/" not in href:
-			continue
-		url = _canonical_url(urljoin(BASE, href))
-		if url in fallbacks:
-			continue
-		container = _find_event_listing_container(a)
-		text = container.get_text(" ", strip=True)
-		parsed_date = _parse_date_text(text)
-		listing_title = _extract_listing_title(text)
-		anchor_title = _normalize_pfl_text(a.get_text(" ", strip=True))
-		if listing_title and not _is_invalid_pfl_title(listing_title):
-			title = listing_title
-		elif anchor_title and not _is_invalid_pfl_title(anchor_title):
-			title = anchor_title
-		else:
-			title = listing_title or anchor_title
-
-		fallbacks[url] = {
-			"title": title,
-			"event_date": parsed_date,
-		}
-	return fallbacks
-
+# ---- main entry point -------------------------------------------------------
 
 def get_pfl_events() -> List[FightEvent]:
-	listing = fetch_html(f"{BASE}/events")
-	if listing is None:
-		logger.warning("Could not fetch PFL events listing")
-		return []
+    """Fetch upcoming PFL events and return a list of ``FightEvent`` objects."""
+    listing_soup = fetch_html(f"{BASE}/events")
+    if listing_soup is None:
+        logger.warning("Could not fetch PFL events listing")
+        return []
 
-	listing_fallbacks = _build_listing_fallback(listing)
+    cards = _parse_listing_cards(listing_soup)
+    logger.info(
+        "Found %d upcoming event-card entries on PFL listing page", len(cards)
+    )
 
-	links = set()
-	for a in listing.find_all("a", href=True):
-		href = a["href"]
-		if "/events/" not in href:
-			continue
-		url = _canonical_url(urljoin(BASE, href))
-		if url == _canonical_url(urljoin(BASE, "/events")):
-			continue
-		links.add(url)
+    today = datetime.now(RIYADH).date()
+    events: List[FightEvent] = []
+    seen_uids: set = set()
 
-	events: List[FightEvent] = []
-	for url in sorted(links):
-		soup = fetch_html(url)
-		if soup is None:
-			continue
+    for card in cards:
+        url = card["url"]
+        prelim_date: Optional[date] = card["date"]
+        card_text: str = card["card_text"]
 
-		jsonlds = extract_json_ld(soup)
-		parsed = None
-		for obj in jsonlds:
-			ev = _parse_jsonld_event(obj)
-			if ev:
-				parsed = ev
-				break
+        # Skip clearly past events to avoid unnecessary HTTP requests.
+        if prelim_date is not None and prelim_date < today - timedelta(days=1):
+            logger.debug(
+                "Skipping past PFL event (listing date %s): %s", prelim_date, url
+            )
+            continue
 
-		if parsed is None:
-			title = _extract_pfl_title(soup)
-			fallback = listing_fallbacks.get(url)
-			fallback_title = fallback["title"] if fallback else None
-			if title is None:
-				title = _clean_pfl_title(fallback_title)
-			if title is None and fallback_title and not _is_invalid_pfl_title(fallback_title):
-				title = fallback_title
-			if title is not None and title.strip().upper() == "PFL EVENT":
-				title = None
-			event_date = _extract_event_date(soup) or (fallback["event_date"] if fallback else None)
-			parsed = FightEvent(
-				organization="PFL",
-				event_name=title,
-				slug=url,
-				main_event=None,
-				location=None,
-				event_date=event_date,
-				early_prelims=None,
-				prelims=None,
-				main_card=None,
-				source_url=url,
-			)
+        # Fetch the individual event page.
+        soup = fetch_html(url)
+        if soup is None:
+            logger.warning("Could not fetch PFL event page: %s", url)
+            continue
 
-		if not _is_future_event(parsed):
-			logger.debug("Skipping past or undated PFL event: %s", url)
-			continue
+        # Title
+        title = _extract_event_title(soup)
+        if not title:
+            logger.debug("No usable title for PFL event %s; skipping", url)
+            continue
 
-		events.append(parsed)
+        # Date -- prefer confirmed page date over listing date.
+        event_date = _extract_event_date_from_page(soup) or prelim_date
 
-	return events
+        # Card times (extracted from listing card text).
+        times = _parse_card_times(card_text, event_date or prelim_date)
 
+        # Location
+        location = _extract_location_from_page(soup)
+
+        # Main event
+        main_event = _extract_main_event_from_page(soup)
+
+        uid = _canonical_url(url)
+        if uid in seen_uids:
+            continue
+        seen_uids.add(uid)
+
+        fe = FightEvent(
+            organization="PFL",
+            event_name=title,
+            slug=uid,
+            main_event=main_event,
+            fight_list=None,
+            location=location,
+            event_date=event_date,
+            early_prelims=times["early_prelims"],
+            prelims=times["prelims"],
+            main_card=times["main_card"],
+            source_url=url,
+        )
+
+        if not _is_future_event(fe):
+            logger.debug(
+                "Skipping past PFL event (page date %s): %s", event_date, url
+            )
+            continue
+
+        events.append(fe)
+        logger.info(
+            "PFL event: %s | date=%s | main_event=%s", title, event_date, main_event
+        )
+
+    return events

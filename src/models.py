@@ -9,13 +9,14 @@ class FightEvent:
     event_name: str
     slug: str
 
-    main_event: Optional[str]
+    main_event: Optional[str] = None
+    fight_list: Optional[str] = None
 
-    location: Optional[str]
+    location: Optional[str] = None
 
-    event_date: Optional[date]
-    early_prelims: Optional[datetime]
-    prelims: Optional[datetime]
-    main_card: Optional[datetime]
+    event_date: Optional[date] = None
+    early_prelims: Optional[datetime] = None
+    prelims: Optional[datetime] = None
+    main_card: Optional[datetime] = None
 
-    source_url: Optional[str]
+    source_url: Optional[str] = None

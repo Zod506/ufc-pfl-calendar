@@ -4,7 +4,8 @@ This module creates a single `output/calendar.ics` file containing one
 calendar event per fight card. Each calendar event's start time is the
 `main_card` kickoff (or the earliest available time if main card is
 missing). The description contains Main Event, venue and official URL.
-All times are converted to Asia/Riyadh.
+All times are converted to Asia/Riyadh.  Events with no known time are
+added as all-day events.  No synthetic times are ever invented.
 """
 from __future__ import annotations
 
@@ -22,7 +23,8 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
-OUTPUT = Path("output") / "calendar.ics"
+# Always write to <project_root>/output/calendar.ics regardless of cwd.
+OUTPUT = Path(__file__).resolve().parent.parent / "output" / "calendar.ics"
 
 
 def _stable_uid(ev: FightEvent) -> str:
@@ -36,12 +38,12 @@ def _stable_uid(ev: FightEvent) -> str:
 
 
 def _choose_start(event: FightEvent):
-	# Use main_card when available. If the event has no confirmed main_card
-	# but the date is known, use noon Asia/Riyadh. Otherwise skip the event.
-	if event.main_card is not None:
-		return event.main_card
-	if event.event_date is not None:
-		return datetime.combine(event.event_date, time(12, 0), tzinfo=RIYADH)
+	# Use the *earliest* known card time so the calendar entry begins when doors
+	# open (early prelims > prelims > main card).  If no times are known, return
+	# None -- the caller will create an all-day event.  Never synthesize times.
+	for t in (event.early_prelims, event.prelims, event.main_card):
+		if t is not None:
+			return t
 	return None
 
 
@@ -51,20 +53,45 @@ def build_calendar(events: Iterable[FightEvent]) -> Path:
 	Returns the path to the written file.
 	"""
 	cal = Calendar()
-	for ev in events:
-		start = _choose_start(ev)
-		if start is None:
-			logger.warning("Event %s has no start times; skipping event", ev.event_name)
-			continue
+	seen_uids: set = set()
 
+	# Sort chronologically: timed events first, then all-day by date.
+	def _sort_key(ev: FightEvent):
+		start = _choose_start(ev)
+		if start is not None:
+			return start.astimezone(RIYADH)
+		if ev.event_date is not None:
+			return datetime.combine(ev.event_date, time(0, 0), tzinfo=RIYADH)
+		return datetime.max.replace(tzinfo=RIYADH)
+
+	sorted_events = sorted(events, key=_sort_key)
+
+	for ev in sorted_events:
+		uid = _stable_uid(ev)
+		if uid in seen_uids:
+			logger.debug("Skipping duplicate event UID: %s", uid)
+			continue
+		seen_uids.add(uid)
+
+		start = _choose_start(ev)
 		e = Event()
 		e.name = f"{ev.organization}: {ev.event_name}"
-		# Ensure datetime uses Riyadh tzinfo
-		e.begin = start.astimezone(RIYADH)
-		e.duration = {"hours": 4}
+		e.uid = uid
 		e.description = _render_description(ev)
-		# stable UID so updates replace existing entries instead of duplicating
-		e.uid = _stable_uid(ev)
+
+		if start is not None:
+			e.begin = start.astimezone(RIYADH)
+			e.duration = {"hours": 4}
+		elif ev.event_date is not None:
+			# All-day event -- no synthetic time.
+			e.begin = ev.event_date.isoformat()
+			e.make_all_day()
+		else:
+			logger.warning(
+				"Event %s has no date or time; skipping", ev.event_name
+			)
+			continue
+
 		cal.events.add(e)
 
 	OUTPUT.parent.mkdir(parents=True, exist_ok=True)

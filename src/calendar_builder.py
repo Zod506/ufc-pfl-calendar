@@ -101,24 +101,40 @@ def build_calendar(events: Iterable[FightEvent]) -> Path:
 
 
 def _render_description(ev: FightEvent) -> str:
-	parts = []
-	# Main event text
-	if ev.main_event:
-		parts.append(f"Main Event: {ev.main_event}")
-	else:
-		parts.append("Main Event: Not announced yet")
+	parts = ["━━━━━━━━━━━━━━", "", "🥊 Main Event", ""]
+	parts.append(ev.main_event or "Not announced yet")
+
+	if ev.co_main_event:
+		parts.extend(["", "🥈 Co-Main Event", "", ev.co_main_event])
+
+	if ev.main_event_division:
+		parts.extend(["", "🥋 Division", "", ev.main_event_division])
+
+	if ev.main_event_is_championship:
+		parts.extend(["", "🏆 Championship Fight"])
+
+	if ev.fight_list:
+		parts.extend(["", "📋 Fight Card", "", ev.fight_list])
+
 	if ev.location:
-		parts.append(f"Venue: {ev.location}")
+		parts.extend(["", "📍 Venue", "", ev.location])
+
 	if ev.source_url:
-		parts.append(f"Official URL: {ev.source_url}")
+		parts.extend(["", "🌐 Official", "", ev.source_url])
 
-	# Add timing lines
-	def fmt(label, dt):
-		return f"{label}: {dt.astimezone(RIYADH).isoformat()}" if dt else f"{label}: Not announced yet"
+	parts.extend(["", "━━━━━━━━━━━━━━", ""])
 
-	parts.append(fmt("🟢 Early Prelims", ev.early_prelims))
-	parts.append(fmt("🟡 Prelims", ev.prelims))
-	parts.append(fmt("🔴 Main Card", ev.main_card))
+	def fmt(dt) -> str:
+		if dt is None:
+			return "Not announced yet"
+		riyadh = dt.astimezone(RIYADH)
+		hour = riyadh.hour % 12 or 12
+		ampm = "AM" if riyadh.hour < 12 else "PM"
+		return f"{hour}:{riyadh.minute:02d} {ampm}"
+
+	parts.extend(["🟢 Early Prelims", "", fmt(ev.early_prelims), ""])
+	parts.extend(["🟡 Prelims", "", fmt(ev.prelims), ""])
+	parts.extend(["🔴 Main Card", "", fmt(ev.main_card)])
 
 	return "\n".join(parts)
 

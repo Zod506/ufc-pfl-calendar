@@ -89,3 +89,27 @@ def test_html_scan_for_matchup():
         soup = BeautifulSoup(html, "lxml")
         out = parse_html_schedule(soup)
         assert out["main_event"] == "Islam Makhachev vs Ilia Topuria"
+
+
+def test_parse_html_schedule_from_data_timestamp():
+        html = """
+        <div>
+            <li>
+                <div>Early Prelims</div>
+                <div class='tz-change-inner' data-timestamp='1783803600'>5:00 PM EDT</div>
+            </li>
+            <li>
+                <div>Prelims</div>
+                <div class='tz-change-inner' data-timestamp='1783807200'>6:00 PM EDT</div>
+            </li>
+            <li>
+                <div>Main Card</div>
+                <div class='tz-change-inner' data-timestamp='1783814400'>8:00 PM EDT</div>
+            </li>
+        </div>
+        """
+        soup = BeautifulSoup(html, "lxml")
+        out = parse_html_schedule(soup)
+        assert out["early_prelims"] == datetime.fromtimestamp(1783803600, tz=timezone.utc)
+        assert out["prelims"] == datetime.fromtimestamp(1783807200, tz=timezone.utc)
+        assert out["main_card"] == datetime.fromtimestamp(1783814400, tz=timezone.utc)

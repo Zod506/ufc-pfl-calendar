@@ -5,16 +5,17 @@ must be provided via the SPORTSDATA_API_KEY environment variable.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import os
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 from dateutil import parser as date_parser
 
+from fetcher import fetch_html
 from models import FightEvent
 from timezone import RIYADH, to_riyadh
 
@@ -26,6 +27,63 @@ EVENT_ENDPOINT = f"{API_BASE}/Event"
 API_KEY_ENV = "SPORTSDATA_API_KEY"
 EASTERN = ZoneInfo("America/New_York")
 UTC = timezone.utc
+
+# Fallback URL shown to users when no specific event page can be determined.
+UFC_EVENTS_URL = "https://www.ufc.com/events"
+
+# Source for card-segment timing (Early Prelims / Prelims / Main Card).
+UFC_WATCH_SCHEDULE_URL = "https://www.ufc.com/watch/schedule"
+
+# Timezone abbreviations used on UFC.com pages.
+_UFC_TZ_MAP: Dict[str, str] = {
+    "EDT": "America/New_York",
+    "EST": "America/New_York",
+    "CDT": "America/Chicago",
+    "CST": "America/Chicago",
+    "MDT": "America/Denver",
+    "MST": "America/Denver",
+    "PDT": "America/Los_Angeles",
+    "PST": "America/Los_Angeles",
+    "BST": "Europe/London",
+    "GMT": "UTC",
+    "UTC": "UTC",
+    "CEST": "Europe/Paris",
+    "CET": "Europe/Paris",
+    "EEST": "Europe/Helsinki",
+    "EET": "Europe/Helsinki",
+    "GST": "Asia/Dubai",
+    "AST": "Asia/Riyadh",
+    "AEST": "Australia/Sydney",
+    "AEDT": "Australia/Sydney",
+    "JST": "Asia/Tokyo",
+}
+
+# Matches one entry on the watch/schedule page, e.g.:
+# "Jul 11 Sat UFC 329 Early Prelims Sat Jul 11 17  EDT"
+# "Jul 18 Sat UFC Fight Night Prelims Sat Jul 18 17  EDT"
+_WATCH_ENTRY_RE = re.compile(
+    r"(?P<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(?P<day>\d{1,2})\s+"
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+    r"(?P<event>UFC\s+\d+|UFC\s+Fight\s+Night(?:\s*[:\-]\s*.+?)?)\s+"
+    r"(?P<card>Early\s+Prelims?|Prelims?|Main\s+Card)\s+"
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+"
+    r"(?P<hour>\d{1,2})"
+    r"(?::(?P<minute>\d{2}))?\s*"
+    r"(?P<ampm>AM|PM)?\s+"
+    r"(?P<tz>[A-Z]{2,5})",
+    re.IGNORECASE,
+)
+
+
+def _normalize_watch_event_short(raw_event: str) -> str:
+    normalized = re.sub(r"\s+", " ", (raw_event or "")).strip().upper()
+    m = re.match(r"^(UFC\s+\d+)\b", normalized)
+    if m:
+        return m.group(1)
+    if normalized.startswith("UFC FIGHT NIGHT"):
+        return "UFC FIGHT NIGHT"
+    return normalized
 
 
 def _get_api_key() -> Optional[str]:
@@ -57,6 +115,41 @@ def _normalize_text(text: Optional[str]) -> Optional[str]:
         return None
     cleaned = re.sub(r"\s+", " ", text).strip()
     return cleaned or None
+
+
+def _format_venue_lines(
+    venue_name: Optional[str], city: Optional[str], state: Optional[str], country: Optional[str]
+) -> Optional[str]:
+    first = _normalize_text(venue_name)
+    locality_parts = [
+        _normalize_text(city),
+        _normalize_text(state),
+        _normalize_text(country),
+    ]
+    locality = ", ".join([p for p in locality_parts if p])
+    if first and locality:
+        return f"{first}\n{locality}"
+    if first:
+        return first
+    if locality:
+        return locality
+    return None
+
+
+def _split_single_line_venue(text: Optional[str]) -> Optional[str]:
+    """Convert one-line venue text into a two-line layout when possible."""
+    cleaned = _normalize_text(text)
+    if not cleaned:
+        return None
+    if "\n" in cleaned:
+        return cleaned
+    if "," in cleaned:
+        left, right = cleaned.split(",", 1)
+        left = left.strip()
+        right = right.strip()
+        if left and right:
+            return f"{left}\n{right}"
+    return cleaned
 
 
 def _is_date_only(value: Any) -> bool:
@@ -150,21 +243,36 @@ def _extract_event_id(event: Dict[str, Any]) -> Optional[str]:
 def _extract_location(event: Dict[str, Any]) -> Optional[str]:
     venue = event.get("Venue") or event.get("Arena") or event.get("Location")
     if isinstance(venue, str) and venue.strip():
-        return _normalize_text(venue)
+        city = event.get("City") if isinstance(event.get("City"), str) else None
+        state = event.get("State") if isinstance(event.get("State"), str) else None
+        country = event.get("Country") if isinstance(event.get("Country"), str) else None
+        return _format_venue_lines(venue, city, state, country)
     if isinstance(venue, dict):
+        venue_name = venue.get("Name") or venue.get("Venue") or venue.get("Location")
+        city = venue.get("City") or event.get("City")
+        state = venue.get("State") or event.get("State")
+        country = venue.get("Country") or event.get("Country")
+        formatted = _format_venue_lines(
+            venue_name if isinstance(venue_name, str) else None,
+            city if isinstance(city, str) else None,
+            state if isinstance(state, str) else None,
+            country if isinstance(country, str) else None,
+        )
+        if formatted:
+            return formatted
         candidates: list[str] = []
         for key in ("Name", "Venue", "Location", "City", "State", "Country"):
             value = venue.get(key)
             if isinstance(value, str) and value.strip():
                 candidates.append(value.strip())
         if candidates:
-            return _normalize_text(", ".join(dict.fromkeys(candidates)))
+            return _split_single_line_venue(_normalize_text(", ".join(dict.fromkeys(candidates))))
     city = event.get("City")
     state = event.get("State")
     country = event.get("Country")
     parts = [part for part in (city, state, country) if isinstance(part, str) and part.strip()]
     if parts:
-        return _normalize_text(", ".join(parts))
+        return _format_venue_lines(None, city if isinstance(city, str) else None, state if isinstance(state, str) else None, country if isinstance(country, str) else None)
     return None
 
 
@@ -187,9 +295,142 @@ def _extract_fighter_name(fight: Dict[str, Any], prefix: str) -> Optional[str]:
 def _extract_fight_text(fight: Dict[str, Any]) -> Optional[str]:
     left = _extract_fighter_name(fight, "Fighter1")
     right = _extract_fighter_name(fight, "Fighter2")
+    if not (left and right):
+        fighters = fight.get("Fighters") if isinstance(fight, dict) else None
+        if isinstance(fighters, list) and len(fighters) >= 2:
+            names = []
+            for f in fighters[:2]:
+                if not isinstance(f, dict):
+                    continue
+                first = _normalize_text(f.get("FirstName"))
+                last = _normalize_text(f.get("LastName"))
+                name = _normalize_text(" ".join([p for p in (first, last) if p]))
+                if name:
+                    names.append(name)
+            if len(names) >= 2:
+                left, right = names[0], names[1]
     if left and right:
         return f"{left} vs {right}"
     return None
+
+
+def _matchup_key(matchup: Optional[str]) -> Optional[tuple[str, str]]:
+    if not matchup or " vs " not in matchup.lower():
+        return None
+    parts = re.split(r"\s+v(?:s)?\.?\s+", matchup, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return None
+
+    def norm(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
+    a = norm(parts[0])
+    b = norm(parts[1])
+    if not a or not b:
+        return None
+    return tuple(sorted((a, b)))
+
+
+def _parse_division_from_label(label: Optional[str]) -> Optional[str]:
+    cleaned = _normalize_text(label)
+    if not cleaned:
+        return None
+    if "scrambled" in cleaned.lower():
+        return None
+    cleaned = re.sub(r"#\d+", "", cleaned)
+    cleaned = re.sub(r"\b(?:title\s+bout|championship\s+bout|bout)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -")
+    return cleaned or None
+
+
+def _is_official_championship_label(label: Optional[str]) -> bool:
+    if not label:
+        return False
+    ll = label.lower()
+    return any(k in ll for k in ("title bout", "championship", "interim title", "interim"))
+
+
+def _extract_ufc_metadata_from_api(
+    event_detail: Dict[str, Any],
+    main_event: Optional[str],
+) -> tuple[Optional[str], Optional[str], bool]:
+    """Return (co_main_event, main_division, main_is_championship) from API only."""
+    co_main_event: Optional[str] = None
+    main_division: Optional[str] = None
+    main_is_championship = False
+    target_key = _matchup_key(main_event)
+
+    fights = event_detail.get("Fights") or []
+    for fight in fights:
+        if not isinstance(fight, dict):
+            continue
+        matchup = _extract_fight_text(fight)
+        if not matchup:
+            continue
+        segment = _normalize_text(fight.get("CardSegment"))
+        weight_class = _normalize_text(fight.get("WeightClass"))
+
+        if segment and "co-main" in segment.lower() and not co_main_event:
+            co_main_event = matchup
+
+        if target_key and _matchup_key(matchup) == target_key:
+            main_division = _parse_division_from_label(weight_class or segment)
+            main_is_championship = _is_official_championship_label(weight_class) or _is_official_championship_label(segment)
+
+    return co_main_event, main_division, main_is_championship
+
+
+def _fetch_ufc_event_page_metadata(event_url: str, main_event: Optional[str]) -> Dict[str, Any]:
+    """Extract venue/division/championship/co-main from official UFC event page."""
+    out: Dict[str, Any] = {
+        "location": None,
+        "co_main_event": None,
+        "main_event_division": None,
+        "main_event_is_championship": False,
+    }
+    if not event_url:
+        return out
+    try:
+        soup = fetch_html(event_url, timeout=10)
+        if soup is None:
+            return out
+        title_tag = soup.find("title")
+        if title_tag and title_tag.string and "search" in title_tag.string.lower():
+            return out
+
+        venue_node = soup.find("div", class_=re.compile(r"field--name-venue|c-hero__text|hero-fixed-bar__place"))
+        if venue_node:
+            out["location"] = _split_single_line_venue(venue_node.get_text(" ", strip=True))
+
+        target_key = _matchup_key(main_event)
+        for li in soup.select("li.l-listing__item"):
+            fighters = [
+                _normalize_text(n.get_text(" ", strip=True))
+                for n in li.select(".c-listing-fight__corner-name")
+            ]
+            fighters = [n for n in fighters if n]
+            if len(fighters) < 2:
+                continue
+            matchup = f"{fighters[0]} vs {fighters[1]}"
+
+            class_node = li.select_one(".c-listing-fight__class-text")
+            class_text = class_node.get_text(" ", strip=True) if class_node else ""
+            li_text = li.get_text(" ", strip=True).lower()
+            is_explicit_main = "main event" in li_text
+            is_explicit_co_main = "co-main" in li_text
+
+            if is_explicit_co_main and not out["co_main_event"]:
+                out["co_main_event"] = matchup
+
+            if target_key and _matchup_key(matchup) == target_key:
+                out["main_event_division"] = _parse_division_from_label(class_text)
+                out["main_event_is_championship"] = _is_official_championship_label(class_text) or _is_official_championship_label(li_text)
+                if is_explicit_main:
+                    # Keep explicit marker if available for future resilience.
+                    out["main_event_division"] = out["main_event_division"]
+    except Exception as exc:
+        logger.debug("Could not parse UFC event metadata from %s: %s", event_url, exc)
+    return out
 
 
 def _extract_fights(event_detail: Dict[str, Any]) -> list[str]:
@@ -220,6 +461,208 @@ def _build_source_url(event: Dict[str, Any], event_id: Optional[str]) -> Optiona
     return None
 
 
+# ── Card-timing helpers ────────────────────────────────────────────────────────
+
+def _watch_schedule_key(event_name: str, eastern_date: date) -> Optional[Tuple[str, date]]:
+    """Build a lookup key for the watch-schedule dict.
+
+    Normalises: "UFC 329: McGregor vs. Holloway 2" → ("UFC 329", date)
+                "UFC Fight Night: Ankalaev vs. ..."  → ("UFC FIGHT NIGHT", date)
+    """
+    name = (event_name or "").upper().strip()
+    m = re.match(r"^(UFC\s+\d+)", name)
+    if m:
+        return (re.sub(r"\s+", " ", m.group(1)).strip(), eastern_date)
+    if "UFC FIGHT NIGHT" in name:
+        return ("UFC FIGHT NIGHT", eastern_date)
+    return None
+
+
+def _fetch_ufc_watch_schedule() -> Dict[Tuple[str, date], Dict[str, Optional[datetime]]]:
+    """Fetch https://www.ufc.com/watch/schedule and extract card-segment times.
+
+    The page contains entries like:
+      "Jul 11 Sat UFC 329 Early Prelims Sat Jul 11 17  EDT"
+      "Jul 18 Sat UFC Fight Night Prelims Sat Jul 18 17  EDT"
+
+    Returns {(event_short, eastern_date): {early_prelims, prelims, main_card}}
+    with all datetimes converted to Asia/Riyadh.
+    """
+    result: Dict[Tuple[str, date], Dict[str, Optional[datetime]]] = {}
+    try:
+        soup = fetch_html(UFC_WATCH_SCHEDULE_URL, timeout=12)
+        if soup is None:
+            logger.warning("Could not fetch UFC watch schedule")
+            return result
+
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+        today_eastern = datetime.now(ZoneInfo("America/New_York")).date()
+
+        for m in _WATCH_ENTRY_RE.finditer(text):
+            month_str = m.group("month")
+            day = int(m.group("day"))
+            event_short = _normalize_watch_event_short(m.group("event"))
+            card_label = m.group("card").strip().lower()
+            hour = int(m.group("hour"))
+            minute = int(m.group("minute") or 0)
+            ampm = (m.group("ampm") or "").upper()
+            tz_abbr = m.group("tz").upper()
+
+            # Watch schedule sometimes emits 12-hour values with AM/PM.
+            if ampm:
+                if hour == 12:
+                    hour = 0
+                if ampm == "PM":
+                    hour += 12
+
+            tz_name = _UFC_TZ_MAP.get(tz_abbr, "America/New_York")
+            tz = ZoneInfo(tz_name)
+
+            # Infer calendar year from today (all entries are "Upcoming").
+            year = today_eastern.year
+            try:
+                candidate = date_parser.parse(f"{month_str} {day} {year}").date()
+                if candidate < today_eastern - timedelta(days=7):
+                    year += 1
+                eastern_date = date_parser.parse(f"{month_str} {day} {year}").date()
+                event_dt = datetime(eastern_date.year, eastern_date.month,
+                                    eastern_date.day, hour, minute, tzinfo=tz)
+                riyadh_dt = event_dt.astimezone(RIYADH)
+            except Exception:
+                continue
+
+            key: Tuple[str, date] = (event_short, eastern_date)
+            if key not in result:
+                result[key] = {"early_prelims": None, "prelims": None, "main_card": None}
+
+            lc = card_label.replace(" ", "_")
+            if "early" in lc:
+                result[key]["early_prelims"] = riyadh_dt
+            elif "prelim" in lc:
+                result[key]["prelims"] = riyadh_dt
+            elif "main" in lc:
+                result[key]["main_card"] = riyadh_dt
+
+        logger.info("UFC watch schedule: %d event entries parsed", len(result))
+    except Exception as exc:
+        logger.warning("Error parsing UFC watch schedule: %s", exc)
+    return result
+
+
+def _fetch_ufc_numbered_event_timestamps(event_url: str) -> Dict[str, Optional[datetime]]:
+    """Scrape card-segment times from a numbered UFC event page (e.g. /event/ufc-329).
+
+    Uses the Unix ``data-timestamp`` attribute on
+    ``c-listing-viewing-option__time`` elements for timezone-safe conversion.
+
+    Only works for numbered PPV events where the URL pattern is reliable.
+    Returns {early_prelims, prelims, main_card} (values may be None).
+    """
+    result: Dict[str, Optional[datetime]] = {
+        "early_prelims": None,
+        "prelims": None,
+        "main_card": None,
+    }
+    if not event_url or "fight-night" in event_url.lower():
+        # Fight Night slugs are unreliable — skip to avoid landing on search page.
+        return result
+    try:
+        soup = fetch_html(event_url, timeout=10)
+        if soup is None:
+            return result
+
+        # Detect if we landed on a search/404 page.
+        title_tag = soup.find("title")
+        if title_tag and title_tag.string and "search" in title_tag.string.lower():
+            logger.debug("UFC event page %s returned search page — skipping", event_url)
+            return result
+
+        how_to_div = soup.find("div", class_="c-how-to-watch--event-main-card-list")
+        if how_to_div is None:
+            return result
+
+        for li in how_to_div.find_all("li"):
+            label_div = li.find(class_="c-listing-viewing-option__fight-card")
+            time_div = li.find(class_="c-listing-viewing-option__time")
+            if not label_div or not time_div:
+                continue
+
+            label = label_div.get_text(" ", strip=True).lower().replace(" ", "_")
+            ts_str = time_div.get("data-timestamp")
+            if not ts_str:
+                continue
+            try:
+                ts = int(ts_str)
+                riyadh_dt = datetime.fromtimestamp(ts, tz=UTC).astimezone(RIYADH)
+            except (ValueError, OSError, OverflowError):
+                continue
+
+            if "early" in label:
+                result["early_prelims"] = riyadh_dt
+            elif "prelim" in label:
+                result["prelims"] = riyadh_dt
+            elif "main" in label:
+                result["main_card"] = riyadh_dt
+
+        filled = sum(1 for v in result.values() if v is not None)
+        logger.debug("UFC event page %s: %d segment times found", event_url, filled)
+
+    except Exception as exc:
+        logger.debug("Error fetching UFC event page %s: %s", event_url, exc)
+    return result
+
+
+def _extract_main_event_from_title(event_name: str) -> Optional[str]:
+    """Extract 'Fighter A vs Fighter B' from titles like 'UFC 329: A vs. B'.
+
+    Returns None when the title does not contain a clearly formatted matchup.
+    Does not overwrite a value already obtained from the API fight list.
+    """
+    if not event_name:
+        return None
+    # Look for everything after the first ": " that contains "vs"
+    m = re.search(r":\s*(.+\bvs\.?\s+.+)$", event_name, re.IGNORECASE)
+    if not m:
+        return None
+    matchup = m.group(1).strip()
+    # Normalize "vs." to "vs"
+    matchup = re.sub(r"\bvs\.\s*", "vs ", matchup)
+    matchup = re.sub(r"\s+", " ", matchup).strip().rstrip(".")
+    return matchup or None
+
+
+def _is_api_url(url: Optional[str]) -> bool:
+    """Return True when *url* is an internal API endpoint users should not see."""
+    return bool(url and "sportsdata.io" in url)
+
+
+def _build_ufc_event_url(event_name: str) -> Optional[str]:
+    """Construct an official ufc.com event page URL from the event name.
+
+    "UFC 329: …"          → https://www.ufc.com/event/ufc-329
+    "UFC Fight Night: A vs. B" → https://www.ufc.com/event/ufc-fight-night-a-vs-b
+    Returns None when a clean slug cannot be derived.
+    """
+    name = _normalize_text(event_name) or ""
+    # Numbered UFC event: "UFC 329" or "UFC 329: …"
+    m = re.match(r"^UFC\s+(\d+)\b", name, re.IGNORECASE)
+    if m:
+        return f"https://www.ufc.com/event/ufc-{m.group(1)}"
+    # UFC Fight Night: "UFC Fight Night: Fighter A vs. Fighter B"
+    m = re.match(r"^UFC\s+Fight\s+Night\s*[:\-]?\s*(.+)$", name, re.IGNORECASE)
+    if m:
+        after = m.group(1).strip()
+        slug = after.lower()
+        slug = re.sub(r"\bvs\.\s*", "vs-", slug)
+        slug = re.sub(r"[^a-z0-9\s\-]", "", slug)
+        slug = re.sub(r"[\s]+", "-", slug.strip())
+        slug = re.sub(r"-{2,}", "-", slug).strip("-")
+        if slug:
+            return f"https://www.ufc.com/event/ufc-fight-night-{slug}"
+    return None
+
+
+
 def _build_fight_list(event_detail: Dict[str, Any]) -> Optional[str]:
     fights = _extract_fights(event_detail)
     if not fights:
@@ -243,7 +686,11 @@ def _fetch_event_detail(api_key: str, event_id: str) -> Optional[Dict[str, Any]]
     return None
 
 
-def _build_event(schedule_event: Dict[str, Any], api_key: str) -> Optional[FightEvent]:
+def _build_event(
+    schedule_event: Dict[str, Any],
+    api_key: str,
+    watch_schedule: Optional[Dict] = None,
+) -> Optional[FightEvent]:
     event_id = _extract_event_id(schedule_event)
     if not event_id:
         return None
@@ -251,28 +698,106 @@ def _build_event(schedule_event: Dict[str, Any], api_key: str) -> Optional[Fight
     event_detail = _fetch_event_detail(api_key, event_id) or {}
 
     start = _parse_event_start(schedule_event) or _parse_event_start(event_detail)
-    main_card = to_riyadh(start) if start else None
+    main_card_dt = to_riyadh(start) if start else None
     event_date = to_riyadh(start).date() if start else _parse_event_date(schedule_event)
     if event_date is None:
         return None
 
+    # Eastern date of the event (US calendar date, used for watch-schedule lookup).
+    eastern_start = start.astimezone(EASTERN) if start else None
+    eastern_date: date = eastern_start.date() if eastern_start else event_date
+
     event_name = _extract_event_name(schedule_event)
     location = _extract_location(schedule_event) or _extract_location(event_detail)
     fight_list = _build_fight_list(event_detail)
-    main_event = _build_main_event(event_detail) or (fight_list.splitlines()[0] if fight_list else None)
-    source_url = _build_source_url(event_detail, event_id)
+
+    # Main event: prefer API fight data, fall back to event title.
+    main_event = (
+        _build_main_event(event_detail)
+        or (fight_list.splitlines()[0] if fight_list else None)
+        or _extract_main_event_from_title(event_name)
+    )
+
+    co_main_event, main_event_division, main_event_is_championship = _extract_ufc_metadata_from_api(
+        event_detail, main_event
+    )
+
+    # Build a user-facing URL — never expose internal API endpoints.
+    raw_url = _build_source_url(event_detail, event_id)
+    if _is_api_url(raw_url):
+        raw_url = None
+    ufc_page_url = (
+        raw_url if raw_url and "ufc.com" in raw_url
+        else _build_ufc_event_url(event_name)
+    )
+    source_url = raw_url or ufc_page_url or UFC_EVENTS_URL
+
+    # Fill richer metadata from the official UFC event page when API fields are
+    # missing, while preserving SportsDataIO precedence.
+    if ufc_page_url and (
+        not location
+        or not main_event_division
+        or not main_event_is_championship
+        or not co_main_event
+    ):
+        page_meta = _fetch_ufc_event_page_metadata(ufc_page_url, main_event)
+        location = location or page_meta.get("location")
+        main_event_division = main_event_division or page_meta.get("main_event_division")
+        main_event_is_championship = main_event_is_championship or bool(page_meta.get("main_event_is_championship"))
+        co_main_event = co_main_event or page_meta.get("co_main_event")
+
+    # ── Card-segment timing (priority order) ─────────────────────────────────
+    early_prelims: Optional[datetime] = None
+    prelims: Optional[datetime] = None
+
+    # 1. UFC watch/schedule page — single HTTP request, covers near-term events.
+    #    Always prefer this source; override the SportsDataIO main_card time with
+    #    the more precise broadcast schedule when available.
+    if watch_schedule:
+        ws_key = _watch_schedule_key(event_name, eastern_date)
+        if ws_key and ws_key in watch_schedule:
+            ws = watch_schedule[ws_key]
+            early_prelims = ws.get("early_prelims")
+            prelims = ws.get("prelims")
+            if ws.get("main_card"):
+                main_card_dt = ws["main_card"]  # watch schedule is authoritative
+            logger.debug(
+                "Watch schedule match: %s → EP=%s, P=%s, MC=%s",
+                event_name, early_prelims, prelims, main_card_dt,
+            )
+
+    # 2. Individual event page — reliable only for numbered PPV events; provides
+    #    exact Unix timestamps with no timezone ambiguity.
+    if early_prelims is None and prelims is None and ufc_page_url:
+        page = _fetch_ufc_numbered_event_timestamps(ufc_page_url)
+        if any(page.values()):
+            early_prelims = page.get("early_prelims")
+            prelims = page.get("prelims")
+            if page.get("main_card"):
+                main_card_dt = page["main_card"]  # timestamp is more precise
+
+    # Sanity: prelims must come before main card; discard if order is inverted.
+    if prelims and main_card_dt and prelims > main_card_dt:
+        logger.warning(
+            "Prelims (%s) after main card (%s) for %s — discarding prelims",
+            prelims, main_card_dt, event_name,
+        )
+        prelims = None
 
     return FightEvent(
         organization="UFC",
         event_name=event_name,
         slug=event_id,
         main_event=main_event,
+        co_main_event=co_main_event,
+        main_event_division=main_event_division,
+        main_event_is_championship=main_event_is_championship,
         fight_list=fight_list,
         location=location,
         event_date=event_date,
-        early_prelims=None,
-        prelims=None,
-        main_card=main_card,
+        early_prelims=early_prelims,
+        prelims=prelims,
+        main_card=main_card_dt,
         source_url=source_url,
     )
 
@@ -298,6 +823,9 @@ def get_ufc_events() -> List[FightEvent]:
     event_ids: set[str] = set()
     events: List[FightEvent] = []
 
+    # Pre-fetch the UFC watch/schedule page once for card-segment timing.
+    watch_schedule = _fetch_ufc_watch_schedule()
+
     for season in (current_year, next_year):
         url = f"{SCHEDULE_ENDPOINT}/{season}"
         schedule = _fetch_json(url, headers)
@@ -311,7 +839,7 @@ def get_ufc_events() -> List[FightEvent]:
             if not event_id or event_id in event_ids:
                 continue
 
-            event = _build_event(schedule_event, api_key)
+            event = _build_event(schedule_event, api_key, watch_schedule)
             if event is None:
                 continue
             if not _is_future_event(event):

@@ -10,6 +10,9 @@ class FightEvent:
     slug: str
 
     main_event: Optional[str] = None
+    co_main_event: Optional[str] = None
+    main_event_division: Optional[str] = None
+    main_event_is_championship: bool = False
     fight_list: Optional[str] = None
 
     location: Optional[str] = None

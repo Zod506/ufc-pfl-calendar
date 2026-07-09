@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 
 GENERIC_TITLE_KEYWORDS = ("mma schedule", "schedule", "events")
@@ -221,29 +221,89 @@ def parse_html_schedule(soup: BeautifulSoup) -> Dict[str, Optional[datetime]]:
                 out["main_event"] = mm
                 break
 
-    # Helper to find explicit <time datetime> near a label
+    def _parse_timestamp_attr(raw: Optional[str]) -> Optional[datetime]:
+        if not raw:
+            return None
+        try:
+            val = int(str(raw).strip())
+        except Exception:
+            return None
+        # Some pages emit milliseconds; normalize to seconds.
+        if val > 10**12:
+            val //= 1000
+        try:
+            return datetime.fromtimestamp(val, tz=timezone.utc)
+        except Exception:
+            return None
+
+    # Helper to find explicit time values near a label.
     def find_time_by_label(label: str):
+        def _label_matches(text: str) -> bool:
+            normalized = re.sub(r"\s+", " ", (text or "")).strip().lower()
+            target = label.lower()
+            if target == "prelims":
+                return "prelim" in normalized and "early prelim" not in normalized
+            return target in normalized
+
         # Find elements that explicitly contain the label and a <time> child
-        candidates = soup.find_all(lambda tag: tag.name in ("p", "div", "span", "li", "dt", "dd") and tag.get_text(strip=True) and label.lower() in tag.get_text(strip=True).lower())
-        from bs4 import NavigableString
+        candidates = soup.find_all(
+            lambda tag: tag.name in ("p", "div", "span", "li", "dt", "dd")
+            and tag.get_text(strip=True)
+            and _label_matches(tag.get_text(" ", strip=True))
+        )
+        from bs4 import NavigableString, Tag
+
+        def _extract_from_node(node: Tag) -> Optional[datetime]:
+            # 1) explicit <time datetime="...">
+            t = node.find("time")
+            if t and t.has_attr("datetime"):
+                try:
+                    return date_parser.parse(t["datetime"])
+                except Exception:
+                    pass
+
+            # 2) explicit Unix timestamp attribute in the node subtree
+            ts_node = node.find(attrs={"data-timestamp": True})
+            if ts_node is not None:
+                parsed = _parse_timestamp_attr(ts_node.get("data-timestamp"))
+                if parsed is not None:
+                    return parsed
+
+            # 3) the labeled node itself may hold the timestamp
+            parsed = _parse_timestamp_attr(node.get("data-timestamp"))
+            if parsed is not None:
+                return parsed
+
+            return None
+
         for node in candidates:
             # look for the label in the node's immediate text children to avoid
             # matching a large container that contains multiple labeled sections
             found_label = False
             for c in node.contents:
                 if isinstance(c, NavigableString) and c.strip():
-                    if label.lower() in c.strip().lower():
+                    if _label_matches(c.strip()):
                         found_label = True
                         break
             if not found_label:
                 continue
-            # require an explicit <time> element inside the labeled node
-            t = node.find("time")
-            if t and t.has_attr("datetime"):
-                try:
-                    return date_parser.parse(t["datetime"])
-                except Exception:
+
+            parsed = _extract_from_node(node)
+            if parsed is not None:
+                return parsed
+
+            # Some UFC pages place the label and timestamp in sibling nodes.
+            sib_count = 0
+            for sibling in node.next_siblings:
+                if not isinstance(sibling, Tag):
                     continue
+                parsed = _extract_from_node(sibling)
+                if parsed is not None:
+                    return parsed
+                sib_count += 1
+                if sib_count >= 3:
+                    break
+
         # If none of the labeled nodes had an explicit <time>, do not attempt
         # to parse a shared container which may contain multiple labels.
         return None

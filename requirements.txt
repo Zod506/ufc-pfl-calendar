@@ -6,3 +6,4 @@ pytz
 lxml
 feedparser
 pytest
+python-dotenv

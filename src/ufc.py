@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import List, Optional
 from urllib.parse import urljoin
 import logging
+import re
+from datetime import date
 
 from dateutil import parser as date_parser
 
@@ -91,12 +93,21 @@ def _parse_jsonld_event(obj: dict) -> Optional[FightEvent]:
 	if parsed.get("main_event") and is_generic_title(parsed.get("main_event")):
 		parsed["main_event"] = None
 
+	parsed_date = None
+	if start:
+		try:
+			dt = date_parser.parse(start)
+			parsed_date = dt.date()
+		except Exception:
+			parsed_date = None
+
 	fe = FightEvent(
 		organization="UFC",
 		event_name=name or "UFC Event",
 		slug=(url or "").rstrip("/"),
 		main_event=parsed.get("main_event"),
 		location=venue_name,
+		event_date=parsed_date,
 		early_prelims=to_riyadh(parsed.get("early_prelims")) if parsed.get("early_prelims") else None,
 		prelims=to_riyadh(parsed.get("prelims")) if parsed.get("prelims") else None,
 		main_card=to_riyadh(parsed.get("main_card")) if parsed.get("main_card") else None,
@@ -104,6 +115,84 @@ def _parse_jsonld_event(obj: dict) -> Optional[FightEvent]:
 	)
 
 	return fe
+
+
+def _parse_date_text(text: str) -> Optional[date]:
+	if not text:
+		return None
+	text = re.sub(r"\s+", " ", text).strip()
+	if not text:
+		return None
+
+	# Prefer explicit date formats with year and month names.
+	patterns = [
+		r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s*\d{4}\b",
+		r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\b",
+		r"\b\d{4}-\d{2}-\d{2}\b",
+	]
+	for pattern in patterns:
+		match = re.search(pattern, text, flags=re.IGNORECASE)
+		if match:
+			try:
+				dt = date_parser.parse(match.group(0))
+				return dt.date()
+			except Exception:
+				continue
+
+	if not re.search(r"\b20\d{2}\b", text):
+		return None
+
+	try:
+		dt = date_parser.parse(text, fuzzy=True)
+		return dt.date()
+	except Exception:
+		return None
+
+
+def _extract_event_date_from_source(soup, source_obj: Optional[dict] = None) -> Optional[date]:
+	# Prefer explicit structured fields from the embedded JSON source.
+	if isinstance(source_obj, dict):
+		for key in ("eventDate", "startDate", "date", "event_date", "start_date"):
+			value = source_obj.get(key)
+			if isinstance(value, str):
+				dt = _parse_date_text(value)
+				if dt:
+					return dt
+			if isinstance(value, dict):
+				for nested in ("startDate", "date", "eventDate"):
+					nested_value = value.get(nested)
+					if isinstance(nested_value, str):
+						dt = _parse_date_text(nested_value)
+						if dt:
+							return dt
+
+	# Look for explicit <time datetime="..."> tags in the page
+	for time_tag in soup.find_all("time"):
+		if time_tag.has_attr("datetime"):
+			try:
+				dt = date_parser.parse(time_tag["datetime"])
+				return dt.date()
+			except Exception:
+				continue
+
+	# Look for date text in meta description tags.
+	meta_attrs = [
+		{"property": "og:description"},
+		{"property": "og:title"},
+		{"name": "description"},
+		{"name": "twitter:description"},
+		{"name": "twitter:title"},
+	]
+	for attrs in meta_attrs:
+		meta = soup.find("meta", attrs=attrs)
+		if meta and meta.get("content"):
+			dt = _parse_date_text(meta["content"])
+			if dt:
+				return dt
+
+	# Fallback: search page text for a recognizable date string.
+	text = soup.get_text(" ", strip=True)
+	return _parse_date_text(text)
 
 
 def get_ufc_events() -> List[FightEvent]:
@@ -165,6 +254,7 @@ def get_ufc_events() -> List[FightEvent]:
 							slug=url.rstrip("/"),
 							main_event=mapping.get("main_event"),
 							location=None,
+							event_date=_extract_event_date_from_source(soup, obj),
 							early_prelims=to_riyadh(mapping.get("early_prelims")) if mapping.get("early_prelims") else None,
 							prelims=to_riyadh(mapping.get("prelims")) if mapping.get("prelims") else None,
 							main_card=to_riyadh(mapping.get("main_card")) if mapping.get("main_card") else None,
@@ -184,6 +274,7 @@ def get_ufc_events() -> List[FightEvent]:
 					slug=url.rstrip("/"),
 					main_event=html_map.get("main_event"),
 					location=None,
+					event_date=_extract_event_date_from_source(soup),
 					early_prelims=to_riyadh(html_map.get("early_prelims")) if html_map.get("early_prelims") else None,
 					prelims=to_riyadh(html_map.get("prelims")) if html_map.get("prelims") else None,
 					main_card=to_riyadh(html_map.get("main_card")) if html_map.get("main_card") else None,

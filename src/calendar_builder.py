@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Iterable
 from pathlib import Path
+from datetime import datetime, date, time
 import logging
 
 from ics import Calendar, Event
@@ -35,10 +36,12 @@ def _stable_uid(ev: FightEvent) -> str:
 
 
 def _choose_start(event: FightEvent):
-	# Prefer main_card, then prelims, then early_prelims
-	for t in (event.main_card, event.prelims, event.early_prelims):
-		if t is not None:
-			return t
+	# Use main_card when available. If the event has no confirmed main_card
+	# but the date is known, use noon Asia/Riyadh. Otherwise skip the event.
+	if event.main_card is not None:
+		return event.main_card
+	if event.event_date is not None:
+		return datetime.combine(event.event_date, time(12, 0), tzinfo=RIYADH)
 	return None
 
 
@@ -51,15 +54,7 @@ def build_calendar(events: Iterable[FightEvent]) -> Path:
 	for ev in events:
 		start = _choose_start(ev)
 		if start is None:
-			logger.warning("Event %s has no start times; adding without start", ev.event_name)
-			# Create an event without DTSTART; do not invent times or make an all-day placeholder
-			e = Event()
-			e.name = f"{ev.organization}: {ev.event_name}"
-			# leave `begin` unset when there is no confirmed start
-			e.description = _render_description(ev)
-			# stable UID so updates replace existing entries instead of duplicating
-			e.uid = _stable_uid(ev)
-			cal.events.add(e)
+			logger.warning("Event %s has no start times; skipping event", ev.event_name)
 			continue
 
 		e = Event()

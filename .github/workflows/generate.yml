@@ -4,7 +4,11 @@ on:
   push:
     branches: [ main, master ]
   workflow_dispatch: {}
-
+  
+permissions:
+  contents: write
+  pages: write
+  id-token: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -29,14 +33,7 @@ jobs:
       - name: Run calendar generator
         run: python src/main.py
 
-      - name: Commit calendar
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output/calendar.ics || true
-          git commit -m "chore: update calendar.ics [skip ci]" || echo "no changes to commit"
-          git push
-
+    
       - name: Upload calendar artifact
         uses: actions/upload-artifact@v4
         with:

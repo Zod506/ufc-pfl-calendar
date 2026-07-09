@@ -13,6 +13,7 @@ class FightEvent:
     co_main_event: Optional[str] = None
     main_event_division: Optional[str] = None
     main_event_is_championship: bool = False
+    main_event_championship_name: Optional[str] = None
     fight_list: Optional[str] = None
 
     location: Optional[str] = None

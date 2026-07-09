@@ -26,6 +26,75 @@ logger = logging.getLogger(__name__)
 # Always write to <project_root>/output/calendar.ics regardless of cwd.
 OUTPUT = Path(__file__).resolve().parent.parent / "output" / "calendar.ics"
 
+_US_STATE_ABBR = {
+	"AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+	"CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+	"FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+	"IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+	"KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+	"MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+	"MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+	"NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+	"NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+	"OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+	"SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+	"VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+	"WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+}
+
+
+def _normalize_venue_display(location: str) -> str:
+	"""Render venue as two lines: venue name + City, Region, Country where possible."""
+	if not location:
+		return location
+
+	lines = [ln.strip() for ln in str(location).splitlines() if ln.strip()]
+	if not lines:
+		return location
+
+	first = lines[0]
+	second = lines[1] if len(lines) > 1 else ""
+
+	def norm_country(v: str) -> str:
+		ll = v.lower().strip(" .")
+		if ll in ("united states", "us", "usa", "u.s.a"):
+			return "USA"
+		if ll in ("united arab emirates", "uae"):
+			return "UAE"
+		return v
+
+	# If first line already contains locality details after commas, split them out.
+	if not second and "," in first:
+		parts = [p.strip() for p in first.split(",") if p.strip()]
+		if len(parts) >= 2:
+			first = parts[0]
+			second = ", ".join(parts[1:])
+
+	# Normalize whitespace/comma usage and country tokens in locality line.
+	if second:
+		second = " ".join(second.replace(" ,", ",").split())
+		segs = [s.strip() for s in second.split(",") if s.strip()]
+		if len(segs) == 1:
+			raw = segs[0]
+			ll = raw.lower()
+			if ll.endswith(" united states"):
+				segs = [raw[: -len(" united states")].strip(), "USA"]
+			elif ll.endswith(" usa"):
+				segs = [raw[: -len(" usa")].strip(), "USA"]
+			elif ll.endswith(" us"):
+				segs = [raw[: -len(" us")].strip(), "USA"]
+			elif ll.endswith(" united arab emirates"):
+				segs = [raw[: -len(" united arab emirates")].strip(), "UAE"]
+		if segs:
+			if len(segs) >= 2:
+				up = segs[-2].upper()
+				if up in _US_STATE_ABBR:
+					segs[-2] = _US_STATE_ABBR[up]
+			segs[-1] = norm_country(segs[-1])
+			second = ", ".join(segs)
+
+	return f"{first}\n{second}" if second else first
+
 
 def _stable_uid(ev: FightEvent) -> str:
 	"""Generate a deterministic UID for an event.
@@ -111,13 +180,15 @@ def _render_description(ev: FightEvent) -> str:
 		parts.extend(["", "🥋 Division", "", ev.main_event_division])
 
 	if ev.main_event_is_championship:
-		parts.extend(["", "🏆 Championship Fight"])
+		parts.extend(["", "🏆 Championship"])
+		if ev.main_event_championship_name:
+			parts.extend(["", ev.main_event_championship_name])
 
 	if ev.fight_list:
 		parts.extend(["", "📋 Fight Card", "", ev.fight_list])
 
 	if ev.location:
-		parts.extend(["", "📍 Venue", "", ev.location])
+		parts.extend(["", "📍 Venue", "", _normalize_venue_display(ev.location)])
 
 	if ev.source_url:
 		parts.extend(["", "🌐 Official", "", ev.source_url])

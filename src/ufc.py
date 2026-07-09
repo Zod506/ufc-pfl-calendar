@@ -58,6 +58,22 @@ _UFC_TZ_MAP: Dict[str, str] = {
     "JST": "Asia/Tokyo",
 }
 
+_US_STATE_ABBR: Dict[str, str] = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+}
+
 # Matches one entry on the watch/schedule page, e.g.:
 # "Jul 11 Sat UFC 329 Early Prelims Sat Jul 11 17  EDT"
 # "Jul 18 Sat UFC Fight Night Prelims Sat Jul 18 17  EDT"
@@ -117,14 +133,38 @@ def _normalize_text(text: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _normalize_country(country: Optional[str]) -> Optional[str]:
+    c = _normalize_text(country)
+    if not c:
+        return None
+    lc = c.lower()
+    if lc in ("united states", "us", "usa", "u.s.a."):
+        return "USA"
+    if lc in ("united arab emirates", "uae"):
+        return "UAE"
+    return c
+
+
+def _normalize_region(state: Optional[str], country: Optional[str]) -> Optional[str]:
+    s = _normalize_text(state)
+    if not s:
+        return None
+    if _normalize_country(country) == "USA":
+        up = s.upper()
+        return _US_STATE_ABBR.get(up, s)
+    return s
+
+
 def _format_venue_lines(
     venue_name: Optional[str], city: Optional[str], state: Optional[str], country: Optional[str]
 ) -> Optional[str]:
     first = _normalize_text(venue_name)
+    region = _normalize_region(state, country)
+    country_name = _normalize_country(country)
     locality_parts = [
         _normalize_text(city),
-        _normalize_text(state),
-        _normalize_text(country),
+        region,
+        country_name,
     ]
     locality = ", ".join([p for p in locality_parts if p])
     if first and locality:
@@ -331,6 +371,40 @@ def _matchup_key(matchup: Optional[str]) -> Optional[tuple[str, str]]:
     return tuple(sorted((a, b)))
 
 
+def _matchup_lastname_key(matchup: Optional[str]) -> Optional[tuple[str, str]]:
+    if not matchup or " vs " not in matchup.lower():
+        return None
+    parts = re.split(r"\s+v(?:s)?\.?\s+", matchup, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return None
+
+    def norm_last(name: str) -> str:
+        tokens = [t for t in re.split(r"\s+", name.strip()) if t]
+        if not tokens:
+            return ""
+        last = tokens[-1]
+        return re.sub(r"[^a-z0-9]", "", last.lower())
+
+    a = norm_last(parts[0])
+    b = norm_last(parts[1])
+    if not a or not b:
+        return None
+    return tuple(sorted((a, b)))
+
+
+def _extract_matchup_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r"([A-Za-z0-9'.\- ]{2,60}?)\s+v(?:s)?\.?\s+([A-Za-z0-9'.\- ]{2,60})", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    left = _normalize_text(m.group(1))
+    right = _normalize_text(m.group(2))
+    if left and right:
+        return f"{left} vs {right}"
+    return None
+
+
 def _parse_division_from_label(label: Optional[str]) -> Optional[str]:
     cleaned = _normalize_text(label)
     if not cleaned:
@@ -350,14 +424,24 @@ def _is_official_championship_label(label: Optional[str]) -> bool:
     return any(k in ll for k in ("title bout", "championship", "interim title", "interim"))
 
 
+def _championship_name_from_label(label: Optional[str], division: Optional[str]) -> Optional[str]:
+    if not _is_official_championship_label(label):
+        return None
+    prefix = "Interim UFC" if label and "interim" in label.lower() else "UFC"
+    if division:
+        return f"{prefix} {division} Championship"
+    return f"{prefix} Championship"
+
+
 def _extract_ufc_metadata_from_api(
     event_detail: Dict[str, Any],
     main_event: Optional[str],
-) -> tuple[Optional[str], Optional[str], bool]:
-    """Return (co_main_event, main_division, main_is_championship) from API only."""
+) -> tuple[Optional[str], Optional[str], bool, Optional[str]]:
+    """Return (co_main_event, main_division, is_championship, championship_name)."""
     co_main_event: Optional[str] = None
     main_division: Optional[str] = None
     main_is_championship = False
+    championship_name: Optional[str] = None
     target_key = _matchup_key(main_event)
 
     fights = event_detail.get("Fights") or []
@@ -376,8 +460,9 @@ def _extract_ufc_metadata_from_api(
         if target_key and _matchup_key(matchup) == target_key:
             main_division = _parse_division_from_label(weight_class or segment)
             main_is_championship = _is_official_championship_label(weight_class) or _is_official_championship_label(segment)
+            championship_name = _championship_name_from_label(weight_class or segment, main_division)
 
-    return co_main_event, main_division, main_is_championship
+    return co_main_event, main_division, main_is_championship, championship_name
 
 
 def _fetch_ufc_event_page_metadata(event_url: str, main_event: Optional[str]) -> Dict[str, Any]:
@@ -387,6 +472,7 @@ def _fetch_ufc_event_page_metadata(event_url: str, main_event: Optional[str]) ->
         "co_main_event": None,
         "main_event_division": None,
         "main_event_is_championship": False,
+        "main_event_championship_name": None,
     }
     if not event_url:
         return out
@@ -423,8 +509,10 @@ def _fetch_ufc_event_page_metadata(event_url: str, main_event: Optional[str]) ->
                 out["co_main_event"] = matchup
 
             if target_key and _matchup_key(matchup) == target_key:
-                out["main_event_division"] = _parse_division_from_label(class_text)
+                division = _parse_division_from_label(class_text)
+                out["main_event_division"] = division
                 out["main_event_is_championship"] = _is_official_championship_label(class_text) or _is_official_championship_label(li_text)
+                out["main_event_championship_name"] = _championship_name_from_label(class_text or li_text, division)
                 if is_explicit_main:
                     # Keep explicit marker if available for future resilience.
                     out["main_event_division"] = out["main_event_division"]
@@ -459,6 +547,152 @@ def _build_source_url(event: Dict[str, Any], event_id: Optional[str]) -> Optiona
     if event_id:
         return f"{EVENT_ENDPOINT}/{event_id}"
     return None
+
+
+def _parse_listing_month_day(text: Optional[str]) -> Optional[date]:
+    raw = _normalize_text(text)
+    if not raw:
+        return None
+    m = re.search(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\b", raw, flags=re.IGNORECASE)
+    if not m:
+        return None
+    month_str = m.group(1)
+    day = int(m.group(2))
+    today_eastern = datetime.now(EASTERN).date()
+    year = today_eastern.year
+    try:
+        candidate = date_parser.parse(f"{month_str} {day} {year}").date()
+        if candidate < today_eastern - timedelta(days=7):
+            year += 1
+        return date_parser.parse(f"{month_str} {day} {year}").date()
+    except Exception:
+        return None
+
+
+def _parse_listing_time_value(text: str, event_date: Optional[date]) -> Optional[datetime]:
+    if not text or event_date is None:
+        return None
+    m = re.search(r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s+([A-Z]{2,5})", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    time_str = m.group(1).upper().replace(" ", "")
+    tz_abbr = m.group(2).upper()
+    tz_name = _UFC_TZ_MAP.get(tz_abbr, "America/New_York")
+    try:
+        tm = date_parser.parse(time_str).time()
+        dt = datetime(event_date.year, event_date.month, event_date.day, tm.hour, tm.minute, tzinfo=ZoneInfo(tz_name))
+        return dt.astimezone(RIYADH)
+    except Exception:
+        return None
+
+
+def _extract_listing_venue(article) -> Optional[str]:
+    if article is None:
+        return None
+    venue_node = article.select_one(".field--name-venue")
+    loc_node = article.select_one(".field--name-location")
+    venue_text = _normalize_text(venue_node.get_text(" ", strip=True)) if venue_node else None
+    loc_text = _normalize_text(loc_node.get_text(" ", strip=True)) if loc_node else None
+    if not venue_text and not loc_text:
+        return None
+
+    city = None
+    state = None
+    country = None
+    if loc_text:
+        loc_clean = re.sub(r"\s*,\s*", ", ", loc_text)
+        m = re.search(r"(?P<city>[A-Za-z .'-]+),\s*(?P<state>[A-Za-z]{2}|[A-Za-z .'-]+)\s+(?P<country>United\s+States|United\s+Arab\s+Emirates|[A-Za-z .'-]+)$", loc_clean, flags=re.IGNORECASE)
+        if m:
+            city = m.group("city").strip()
+            state = m.group("state").strip()
+            country = m.group("country").strip()
+        else:
+            parts = [p.strip() for p in re.split(r",", loc_clean) if p.strip()]
+            if parts:
+                city = parts[0]
+            if len(parts) > 1:
+                state = parts[1]
+
+    return _format_venue_lines(venue_text, city, state, country)
+
+
+def _fetch_ufc_events_listing_index() -> Dict[tuple[str, str], Dict[str, Any]]:
+    """Return matchup-keyed index from official UFC events listing."""
+    out: Dict[tuple[str, str], Dict[str, Any]] = {}
+    soup = fetch_html(UFC_EVENTS_URL, timeout=12)
+    if soup is None:
+        return out
+
+    for article in soup.select("article.c-card-event--result"):
+        link = article.find("a", href=True)
+        if not link:
+            continue
+        href = _normalize_text(link.get("href"))
+        if not href or "/event/" not in href:
+            continue
+        url = href if href.startswith("http") else f"https://www.ufc.com{href}"
+
+        headline_node = article.select_one(".c-card-event--result__headline")
+        headline = _normalize_text(headline_node.get_text(" ", strip=True)) if headline_node else None
+        mm = _extract_matchup_from_text(headline or "")
+        if not mm:
+            continue
+        key = _matchup_key(mm)
+        if not key:
+            continue
+
+        listing_item = article.find_parent("div", class_="l-listing__item")
+        event_date = None
+        date_node = article.select_one(".c-card-event--result__date")
+        if date_node:
+            event_date = _parse_listing_month_day(date_node.get_text(" ", strip=True))
+
+        times: Dict[str, Optional[datetime]] = {
+            "early_prelims": None,
+            "prelims": None,
+            "main_card": None,
+        }
+        if listing_item is not None:
+            for li in listing_item.select(".c-how-to-watch--event-main-card-list li"):
+                label_node = li.select_one(".c-listing-viewing-option__fight-card")
+                time_node = li.select_one(".c-listing-viewing-option__time")
+                if not label_node or not time_node:
+                    continue
+                label = _normalize_text(label_node.get_text(" ", strip=True) or "")
+                val = None
+                ts = time_node.get("data-timestamp")
+                if ts:
+                    try:
+                        val = datetime.fromtimestamp(int(ts), tz=UTC).astimezone(RIYADH)
+                    except Exception:
+                        val = None
+                if val is None:
+                    val = _parse_listing_time_value(time_node.get_text(" ", strip=True), event_date)
+
+                if not val:
+                    continue
+                ll = label.lower()
+                if "early" in ll:
+                    times["early_prelims"] = val
+                elif "prelim" in ll:
+                    times["prelims"] = val
+                elif "main" in ll:
+                    times["main_card"] = val
+
+        entry = {
+            "url": url,
+            "venue": _extract_listing_venue(article),
+            "times": times,
+        }
+        out[key] = entry
+
+        # Also index by surname-only key so full-name API matchups can map to
+        # official listing cards that use surname headlines.
+        last_key = _matchup_lastname_key(mm)
+        if last_key:
+            out[last_key] = entry
+
+    return out
 
 
 # ── Card-timing helpers ────────────────────────────────────────────────────────
@@ -690,6 +924,7 @@ def _build_event(
     schedule_event: Dict[str, Any],
     api_key: str,
     watch_schedule: Optional[Dict] = None,
+    listing_index: Optional[Dict[tuple[str, str], Dict[str, Any]]] = None,
 ) -> Optional[FightEvent]:
     event_id = _extract_event_id(schedule_event)
     if not event_id:
@@ -718,9 +953,18 @@ def _build_event(
         or _extract_main_event_from_title(event_name)
     )
 
-    co_main_event, main_event_division, main_event_is_championship = _extract_ufc_metadata_from_api(
+    co_main_event, main_event_division, main_event_is_championship, main_event_championship_name = _extract_ufc_metadata_from_api(
         event_detail, main_event
     )
+
+    listing_entry = None
+    mm_key = _matchup_key(main_event) or _matchup_key(_extract_main_event_from_title(event_name) or "")
+    mm_last_key = _matchup_lastname_key(main_event) or _matchup_lastname_key(_extract_main_event_from_title(event_name) or "")
+    if listing_index:
+        if mm_key and mm_key in listing_index:
+            listing_entry = listing_index[mm_key]
+        elif mm_last_key and mm_last_key in listing_index:
+            listing_entry = listing_index[mm_last_key]
 
     # Build a user-facing URL — never expose internal API endpoints.
     raw_url = _build_source_url(event_detail, event_id)
@@ -730,7 +974,14 @@ def _build_event(
         raw_url if raw_url and "ufc.com" in raw_url
         else _build_ufc_event_url(event_name)
     )
+    if listing_entry and listing_entry.get("url"):
+        # Events listing has canonical fight-night URLs when slug generation is unreliable.
+        ufc_page_url = listing_entry["url"]
     source_url = raw_url or ufc_page_url or UFC_EVENTS_URL
+
+    if listing_entry and listing_entry.get("venue"):
+        # Prefer official UFC listing venue over API venue formatting.
+        location = listing_entry["venue"]
 
     # Fill richer metadata from the official UFC event page when API fields are
     # missing, while preserving SportsDataIO precedence.
@@ -741,9 +992,12 @@ def _build_event(
         or not co_main_event
     ):
         page_meta = _fetch_ufc_event_page_metadata(ufc_page_url, main_event)
-        location = location or page_meta.get("location")
+        if page_meta.get("location"):
+            # Event page venue is the highest-confidence official formatting.
+            location = page_meta.get("location")
         main_event_division = main_event_division or page_meta.get("main_event_division")
         main_event_is_championship = main_event_is_championship or bool(page_meta.get("main_event_is_championship"))
+        main_event_championship_name = main_event_championship_name or page_meta.get("main_event_championship_name")
         co_main_event = co_main_event or page_meta.get("co_main_event")
 
     # ── Card-segment timing (priority order) ─────────────────────────────────
@@ -776,6 +1030,16 @@ def _build_event(
             if page.get("main_card"):
                 main_card_dt = page["main_card"]  # timestamp is more precise
 
+    # 3. Official UFC events listing (start times overlay) for remaining gaps.
+    if listing_entry:
+        lt = listing_entry.get("times") or {}
+        if early_prelims is None and lt.get("early_prelims") is not None:
+            early_prelims = lt.get("early_prelims")
+        if prelims is None and lt.get("prelims") is not None:
+            prelims = lt.get("prelims")
+        if main_card_dt is None and lt.get("main_card") is not None:
+            main_card_dt = lt.get("main_card")
+
     # Sanity: prelims must come before main card; discard if order is inverted.
     if prelims and main_card_dt and prelims > main_card_dt:
         logger.warning(
@@ -783,6 +1047,15 @@ def _build_event(
             prelims, main_card_dt, event_name,
         )
         prelims = None
+    if prelims and main_card_dt and prelims == main_card_dt:
+        logger.warning(
+            "Prelims equals main card (%s) for %s — discarding prelims",
+            main_card_dt, event_name,
+        )
+        prelims = None
+
+    if main_event_is_championship and not main_event_championship_name:
+        main_event_championship_name = _championship_name_from_label("championship", main_event_division)
 
     return FightEvent(
         organization="UFC",
@@ -792,6 +1065,7 @@ def _build_event(
         co_main_event=co_main_event,
         main_event_division=main_event_division,
         main_event_is_championship=main_event_is_championship,
+        main_event_championship_name=main_event_championship_name,
         fight_list=fight_list,
         location=location,
         event_date=event_date,
@@ -825,6 +1099,7 @@ def get_ufc_events() -> List[FightEvent]:
 
     # Pre-fetch the UFC watch/schedule page once for card-segment timing.
     watch_schedule = _fetch_ufc_watch_schedule()
+    listing_index = _fetch_ufc_events_listing_index()
 
     for season in (current_year, next_year):
         url = f"{SCHEDULE_ENDPOINT}/{season}"
@@ -839,7 +1114,7 @@ def get_ufc_events() -> List[FightEvent]:
             if not event_id or event_id in event_ids:
                 continue
 
-            event = _build_event(schedule_event, api_key, watch_schedule)
+            event = _build_event(schedule_event, api_key, watch_schedule, listing_index)
             if event is None:
                 continue
             if not _is_future_event(event):

@@ -34,6 +34,22 @@ logger = logging.getLogger(__name__)
 
 BASE = "https://pflmma.com"
 
+_US_STATE_ABBR: Dict[str, str] = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+}
+
 # Timezone abbreviation to IANA name mapping for card-time parsing.
 _TZ_MAP: Dict[str, str] = {
     "ET": "America/New_York",
@@ -405,10 +421,17 @@ def _format_location_from_place(place: Dict[str, Any]) -> Optional[str]:
         return None
     place_name = _normalize(place.get("name"))
     addr = place.get("address") if isinstance(place.get("address"), dict) else {}
+    country_raw = _normalize(addr.get("addressCountry"))
+    country = "USA" if country_raw and country_raw.lower() in ("united states", "us", "usa") else country_raw
+    region_raw = _normalize(addr.get("addressRegion"))
+    if country == "USA" and region_raw and region_raw.upper() in _US_STATE_ABBR:
+        region = _US_STATE_ABBR[region_raw.upper()]
+    else:
+        region = region_raw
     locality_parts = [
         _normalize(addr.get("addressLocality")),
-        _normalize(addr.get("addressRegion")),
-        _normalize(addr.get("addressCountry")),
+        region,
+        country,
     ]
     locality = ", ".join([p for p in locality_parts if p])
 
@@ -439,6 +462,19 @@ def _is_explicit_championship(text: Optional[str]) -> bool:
     return any(k in ll for k in ("title", "championship", "interim belt", "interim world champion"))
 
 
+def _pfl_championship_name(text: Optional[str]) -> Optional[str]:
+    ll = (text or "").lower()
+    if "world" in ll and "title" in ll:
+        if "interim" in ll:
+            return "Interim PFL World Championship"
+        return "PFL World Championship"
+    if "championship" in ll or "title" in ll:
+        if "interim" in ll:
+            return "Interim PFL Championship"
+        return "PFL Championship"
+    return None
+
+
 def _extract_official_metadata_from_page(soup, main_event: Optional[str]) -> Dict[str, Any]:
     """Extract official metadata from PFL JSON-LD only."""
     out: Dict[str, Any] = {
@@ -446,6 +482,8 @@ def _extract_official_metadata_from_page(soup, main_event: Optional[str]) -> Dic
         "co_main_event": None,
         "main_event_division": None,
         "main_event_is_championship": False,
+        "main_event_championship_name": None,
+        "main_event_official": None,
         "fight_list": None,
     }
 
@@ -488,9 +526,11 @@ def _extract_official_metadata_from_page(soup, main_event: Optional[str]) -> Dic
         if target_key and name and _matchup_key(name) == target_key:
             out["main_event_division"] = _extract_division_from_description(desc)
             out["main_event_is_championship"] = _is_explicit_championship(marker_blob)
+            out["main_event_championship_name"] = _pfl_championship_name(marker_blob)
 
     if fight_names:
         out["fight_list"] = "\n".join(fight_names)
+        out["main_event_official"] = fight_names[0]
 
     return out
 
@@ -667,7 +707,15 @@ def get_pfl_events() -> List[FightEvent]:
         co_main_event = official_meta.get("co_main_event")
         main_event_division = official_meta.get("main_event_division")
         main_event_is_championship = bool(official_meta.get("main_event_is_championship"))
+        main_event_championship_name = official_meta.get("main_event_championship_name")
         fight_list = official_meta.get("fight_list")
+
+        # Prefer official fight-card naming when available.
+        official_main = official_meta.get("main_event_official")
+        if official_main:
+            known_keys = {_matchup_key(x) for x in (fight_list or "").splitlines() if _matchup_key(x)}
+            if not main_event or _matchup_key(main_event) not in known_keys:
+                main_event = official_main
 
         uid = _canonical_url(url)
         if uid in seen_uids:
@@ -682,6 +730,7 @@ def get_pfl_events() -> List[FightEvent]:
             co_main_event=co_main_event,
             main_event_division=main_event_division,
             main_event_is_championship=main_event_is_championship,
+            main_event_championship_name=main_event_championship_name,
             fight_list=fight_list,
             location=location,
             event_date=event_date,

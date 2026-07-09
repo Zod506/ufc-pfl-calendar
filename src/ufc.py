@@ -10,13 +10,13 @@ from typing import List, Optional
 from urllib.parse import urljoin
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 
 from dateutil import parser as date_parser
 
 from models import FightEvent
 from fetcher import fetch_html, extract_json_ld, extract_embedded_json
-from timezone import to_riyadh
+from timezone import to_riyadh, RIYADH
 from ufc_parsers import parse_jsonld_schedule, parse_embedded_json_schedule, parse_html_schedule, is_generic_title
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,9 @@ def _parse_jsonld_event(obj: dict) -> Optional[FightEvent]:
 	# Avoid generic titles as main_event
 	if parsed.get("main_event") and is_generic_title(parsed.get("main_event")):
 		parsed["main_event"] = None
+	# Normalize matchup text from JSON-LD sources
+	if parsed.get("main_event"):
+		parsed["main_event"] = _extract_matchup_from_text(parsed["main_event"])
 
 	parsed_date = None
 	if start:
@@ -193,6 +196,92 @@ def _extract_event_date_from_source(soup, source_obj: Optional[dict] = None) -> 
 	# Fallback: search page text for a recognizable date string.
 	text = soup.get_text(" ", strip=True)
 	return _parse_date_text(text)
+
+
+def _normalize_text(text: str) -> str:
+	return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _clean_matchup_text(text: str) -> str:
+	if not text:
+		return ""
+	cleaned = _normalize_text(text)
+	cleaned = re.sub(
+		r"\b(?:Performance Solutions|Solutions|Previous|Next|Follow live|Buy Tickets|VIP Experiences|Register Your Interest|Event Information|View Results|Watch Live|Live Stream|Buy now|Tickets)\b",
+		" ",
+		cleaned,
+		flags=re.IGNORECASE,
+	)
+	cleaned = re.sub(
+		r"\b(?:UFC Fight Night|UFC \d+|UFC)\b",
+		" ",
+		cleaned,
+		flags=re.IGNORECASE,
+	)
+	cleaned = re.sub(
+		r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+		" ",
+		cleaned,
+		flags=re.IGNORECASE,
+	)
+	cleaned = re.sub(r"[–—‑]+", " ", cleaned)
+	return _normalize_text(cleaned)
+
+
+def _extract_matchup_from_text(text: str) -> Optional[str]:
+	if not text:
+		return None
+	cleaned = _clean_matchup_text(text)
+	patterns = [
+		r"\b([A-Z][A-Za-z'’\.\-&]{1,40}(?:\s+[A-Z][A-Za-z'’\.\-&]{1,40}){0,4})\s+(?:vs|v|versus)\.?\s+([A-Z][A-Za-z'’\.\-&]{1,40}(?:\s+[A-Z][A-Za-z'’\.\-&]{1,40}){0,4})\b",
+		r"\b([A-Z][A-Za-z'’\.\-&]{1,40})\s+(?:vs|v|versus)\.?\s+([A-Z][A-Za-z'’\.\-&]{1,40})\b",
+	]
+	for pattern in patterns:
+		match = re.search(pattern, cleaned)
+		if match:
+			left = _normalize_text(match.group(1))
+			right = _normalize_text(match.group(2))
+			candidate = f"{left} vs {right}"
+			if not is_generic_title(candidate):
+				return candidate
+	return None
+
+
+def _extract_ufc_page_matchup(soup) -> Optional[str]:
+	candidates = []
+	if soup.title and soup.title.string:
+		candidates.append(soup.title.string)
+	title_tag = soup.find("h1")
+	if title_tag:
+		candidates.append(title_tag.get_text(" ", strip=True))
+
+	meta_attrs = [
+		{"property": "og:description"},
+		{"property": "og:title"},
+		{"name": "description"},
+		{"name": "twitter:description"},
+		{"name": "twitter:title"},
+	]
+	for attrs in meta_attrs:
+		meta = soup.find("meta", attrs=attrs)
+		if meta and meta.get("content"):
+			candidates.append(meta["content"])
+
+	for text in candidates:
+		matchup = _extract_matchup_from_text(text)
+		if matchup:
+			return matchup
+	return None
+
+
+def _is_future_event(event: FightEvent) -> bool:
+	today = datetime.now(RIYADH).date()
+	if event.event_date is not None:
+		return event.event_date >= today
+	for dt in (event.main_card, event.prelims, event.early_prelims):
+		if dt is not None and to_riyadh(dt).date() >= today:
+			return True
+	return False
 
 
 def get_ufc_events() -> List[FightEvent]:
@@ -301,6 +390,12 @@ def get_ufc_events() -> List[FightEvent]:
 				source_url=url,
 			)
 
+		if parsed:
+			if parsed.main_event:
+				parsed.main_event = _extract_matchup_from_text(parsed.main_event)
+			else:
+				parsed.main_event = _extract_ufc_page_matchup(soup)
+
 		# Skip generic schedule pages that don't contain explicit schedule or headliner
 		# to avoid picking up index pages like "MMA Schedule - 2026".
 		if parsed:
@@ -309,53 +404,12 @@ def get_ufc_events() -> List[FightEvent]:
 				logger.debug("Skipping generic schedule page: %s", url)
 				continue
 
-			# Deduplicate by source_url
-			if parsed.source_url:
-				parsed.source_url = _canonical(parsed.source_url)
+		# Skip events without any date information or that already occurred
+		if not _is_future_event(parsed):
+			logger.debug("Skipping past or undated UFC event: %s", url)
+			continue
 
-			events.append(parsed)
+		events.append(parsed)
 
 	return events
-
-
-def _fetch_from_espn(event_name: str) -> Optional[dict]:
-	"""Best-effort fallback: try to find event schedule on ESPN schedule page.
-
-	This is a documented secondary public source used only when the
-	official UFC event page lacks explicit schedule information.
-	Returns a dict with possible keys: `main_card`, `prelims`,
-	`early_prelims`, `main_event` where values are datetimes.
-	"""
-	try:
-		url = "https://www.espn.com/mma/schedule"
-		soup = fetch_html(url)
-		if not soup:
-			return None
-
-		text_norm = event_name.lower()
-		# Search for a block that contains the event name
-		for block in soup.find_all(lambda tag: tag.name in ("section", "article", "div") and tag.get_text(strip=True)):
-			blk_text = block.get_text(" ", strip=True).lower()
-			if text_norm in blk_text or text_norm.split(" ")[0] in blk_text:
-				# Look for <time> tags inside block
-				times = []
-				for t in block.find_all("time"):
-					if t.has_attr("datetime"):
-						try:
-							times.append(date_parser.parse(t["datetime"]))
-						except Exception:
-							continue
-				out = {}
-				if times:
-					# assign first time as main_card as a best-effort
-					out["main_card"] = times[0]
-				# attempt to extract a main event string
-				he = block.find(lambda tag: tag.name in ("h1", "h2", "h3", "h4") and tag.get_text(strip=True))
-				if he:
-					out["main_event"] = he.get_text(strip=True)
-				return out
-	except Exception:
-		return None
-
-	return None
 

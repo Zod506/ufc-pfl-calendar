@@ -10,13 +10,13 @@ from typing import List, Optional
 from urllib.parse import urljoin
 import logging
 import re
-from datetime import date
+from datetime import date, datetime
 
 from dateutil import parser as date_parser
 
 from models import FightEvent
 from fetcher import fetch_html, extract_json_ld
-from timezone import to_riyadh
+from timezone import to_riyadh, RIYADH
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +163,16 @@ def _extract_event_date(soup) -> Optional[date]:
 	return _parse_date_text(text)
 
 
+def _is_future_event(event: FightEvent) -> bool:
+	today = datetime.now(RIYADH).date()
+	if event.event_date is not None:
+		return event.event_date >= today
+	for dt in (event.main_card, event.prelims, event.early_prelims):
+		if dt is not None and to_riyadh(dt).date() >= today:
+			return True
+	return False
+
+
 def _find_event_listing_container(anchor):
 	for ancestor in anchor.parents:
 		if not hasattr(ancestor, "get_text"):
@@ -182,8 +192,109 @@ def _extract_listing_title(text: str) -> str:
 		return "PFL Event"
 	# Remove date prefixes and common action labels
 	text = re.sub(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+[A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?\b", "", text, flags=re.IGNORECASE).strip()
-	text = re.sub(r"\b(early card|main card|matchups|tickets|buy tickets|view results)\b.*", "", text, flags=re.IGNORECASE).strip()
+	text = re.sub(r"\b(?:early card|main card|matchups|tickets|buy tickets|view results|learn more|register|learn more)\b.*", "", text, flags=re.IGNORECASE).strip()
 	return text or "PFL Event"
+
+
+def _normalize_pfl_text(text: Optional[str]) -> Optional[str]:
+	if not text:
+		return None
+	cleaned = re.sub(r"\s+", " ", text).strip()
+	return cleaned if cleaned else None
+
+
+def _is_invalid_pfl_title(text: Optional[str]) -> bool:
+	if not text:
+		return True
+	cleaned = _normalize_pfl_text(text)
+	if not cleaned:
+		return True
+	if re.fullmatch(r"(?i)(buy tickets|tickets|pfl event|register|watch live|live|previous|next)", cleaned):
+		return True
+	if re.search(r"\b(?:buy tickets|buy now|register|watch live|view tickets|watch now|live|previous|next)\b", cleaned, flags=re.IGNORECASE):
+		return True
+	return False
+
+
+def _clean_pfl_title(text: Optional[str]) -> Optional[str]:
+	cleaned = _normalize_pfl_text(text)
+	if not cleaned:
+		return None
+	# Split on common separators and evaluate each candidate separately.
+	parts = [re.sub(r"[\|•\-]", " ", part).strip() for part in re.split(r"[\|•\-]", cleaned)]
+	candidates = []
+	for part in parts:
+		if not part:
+			continue
+		part_clean = re.sub(r"\b(?:buy tickets|buy now|register|watch live|view tickets|watch now|live|previous|next)\b", "", part, flags=re.IGNORECASE)
+		part_clean = re.sub(r"\s+", " ", part_clean).strip()
+		if not part_clean:
+			continue
+		if _is_invalid_pfl_title(part_clean):
+			continue
+		candidates.append(part_clean)
+	if candidates:
+		for candidate in candidates:
+			if re.match(r"(?i)^pfl\b", candidate):
+				return candidate
+		return max(candidates, key=lambda c: len(c))
+
+	# If the full cleaned string is valid, use it.
+	if not _is_invalid_pfl_title(cleaned):
+		return cleaned
+	return None
+
+
+def _extract_pfl_title(soup) -> Optional[str]:
+	# Prefer JSON-LD name
+	jsonlds = extract_json_ld(soup)
+	for obj in jsonlds:
+		name = obj.get("name") if isinstance(obj.get("name"), str) else None
+		if name:
+			validated = _clean_pfl_title(name)
+			if validated:
+				return validated
+
+	# Prefer OG title
+	meta = soup.find("meta", attrs={"property": "og:title"})
+	if meta and meta.get("content"):
+		validated = _clean_pfl_title(meta["content"])
+		if validated:
+			return validated
+
+	# Prefer Twitter title
+	meta = soup.find("meta", attrs={"name": "twitter:title"})
+	if meta and meta.get("content"):
+		validated = _clean_pfl_title(meta["content"])
+		if validated:
+			return validated
+
+	# If page is on Webook, prefer heading over button text
+	if "webook.com" in (soup.find("meta", attrs={"property": "og:url"}) or {}).get("content", "").lower():
+		title_tag = soup.find("h1")
+		if title_tag:
+			title = title_tag.get_text(" ", strip=True)
+			validated = _clean_pfl_title(title)
+			if validated:
+				return validated
+
+	# Prefer H1
+	title_tag = soup.find("h1")
+	if title_tag:
+		title = title_tag.get_text(" ", strip=True)
+		validated = _clean_pfl_title(title)
+		if validated:
+			return validated
+
+	# Prefer title tag
+	title_tag = soup.find("title")
+	if title_tag and title_tag.string:
+		title = title_tag.string.strip()
+		validated = _clean_pfl_title(title)
+		if validated:
+			return validated
+
+	return None
 
 
 def _build_listing_fallback(listing):
@@ -198,8 +309,17 @@ def _build_listing_fallback(listing):
 		container = _find_event_listing_container(a)
 		text = container.get_text(" ", strip=True)
 		parsed_date = _parse_date_text(text)
+		listing_title = _extract_listing_title(text)
+		anchor_title = _normalize_pfl_text(a.get_text(" ", strip=True))
+		if listing_title and not _is_invalid_pfl_title(listing_title):
+			title = listing_title
+		elif anchor_title and not _is_invalid_pfl_title(anchor_title):
+			title = anchor_title
+		else:
+			title = listing_title or anchor_title
+
 		fallbacks[url] = {
-			"title": a.get_text(strip=True) or _extract_listing_title(text),
+			"title": title,
 			"event_date": parsed_date,
 		}
 	return fallbacks
@@ -238,10 +358,15 @@ def get_pfl_events() -> List[FightEvent]:
 				break
 
 		if parsed is None:
-			title_tag = soup.find("h1")
-			page_title = title_tag.get_text(strip=True) if title_tag else None
+			title = _extract_pfl_title(soup)
 			fallback = listing_fallbacks.get(url)
-			title = page_title or (fallback["title"] if fallback else "PFL Event")
+			fallback_title = fallback["title"] if fallback else None
+			if title is None:
+				title = _clean_pfl_title(fallback_title)
+			if title is None and fallback_title and not _is_invalid_pfl_title(fallback_title):
+				title = fallback_title
+			if title is not None and title.strip().upper() == "PFL EVENT":
+				title = None
 			event_date = _extract_event_date(soup) or (fallback["event_date"] if fallback else None)
 			parsed = FightEvent(
 				organization="PFL",
@@ -255,6 +380,10 @@ def get_pfl_events() -> List[FightEvent]:
 				main_card=None,
 				source_url=url,
 			)
+
+		if not _is_future_event(parsed):
+			logger.debug("Skipping past or undated PFL event: %s", url)
+			continue
 
 		events.append(parsed)
 

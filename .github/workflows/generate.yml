@@ -31,10 +31,12 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Run tests
+            - name: Run tests
         run: pytest -q
 
       - name: Generate calendar
+        env:
+          SPORTSDATA_API_KEY: ${{ secrets.SPORTSDATA_API_KEY }}
         run: python src/main.py
 
       - name: Prepare Pages content

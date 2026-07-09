@@ -31,7 +31,7 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-            - name: Run tests
+      - name: Run tests
         run: pytest -q
 
       - name: Generate calendar

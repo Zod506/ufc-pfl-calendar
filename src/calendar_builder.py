@@ -210,9 +210,40 @@ def _render_description(ev: FightEvent) -> str:
 		ampm = "AM" if riyadh.hour < 12 else "PM"
 		return f"{hour}:{riyadh.minute:02d} {ampm}"
 
-	parts.extend(["🟢 Early Prelims", "", fmt(ev.early_prelims), ""])
-	parts.extend(["🟡 Prelims", "", fmt(ev.prelims), ""])
-	parts.extend(["🔴 Main Card", "", fmt(ev.main_card)])
+	# Presentation-only behavior for PFL: if segment times are not published
+	# separately yet, temporarily display the official event start time.
+	fallback_note = None
+	if (ev.organization or "").upper() == "PFL":
+		official_start = _choose_start(ev)
+		used_fallback = False
+
+		def pfl_display(slot_dt):
+			nonlocal used_fallback
+			if slot_dt is not None:
+				return fmt(slot_dt)
+			if official_start is not None:
+				used_fallback = True
+				return f"{fmt(official_start)} (Fallback)"
+			return "Not announced yet"
+
+		early_text = pfl_display(ev.early_prelims)
+		prelims_text = pfl_display(ev.prelims)
+		main_text = pfl_display(ev.main_card)
+		if used_fallback:
+			fallback_note = (
+				"Official segment times have not been announced separately yet. "
+				"Fallback values use the official event start time temporarily."
+			)
+	else:
+		early_text = fmt(ev.early_prelims)
+		prelims_text = fmt(ev.prelims)
+		main_text = fmt(ev.main_card)
+
+	parts.extend(["🟢 Early Prelims", "", early_text, ""])
+	parts.extend(["🟡 Prelims", "", prelims_text, ""])
+	parts.extend(["🔴 Main Card", "", main_text])
+	if fallback_note:
+		parts.extend(["", "ℹ️ Card Times Note", "", fallback_note])
 
 	return "\n".join(parts)
 

@@ -18,6 +18,7 @@ from ics import Calendar, Event
 
 from models import FightEvent
 from timezone import RIYADH
+from start_time_resolver import resolve_official_start_time
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -109,10 +110,16 @@ def _stable_uid(ev: FightEvent) -> str:
 def _choose_start(event: FightEvent):
 	# Use the *earliest* known card time so the calendar entry begins when doors
 	# open (early prelims > prelims > main card).  If no times are known, return
-	# None -- the caller will create an all-day event.  Never synthesize times.
+	# None -- but first do one final official-source lookup before all-day.
 	for t in (event.early_prelims, event.prelims, event.main_card):
 		if t is not None:
 			return t
+
+	# Final fallback before all-day creation: official sources only.
+	resolved = resolve_official_start_time(event)
+	if resolved is not None:
+		return resolved
+
 	return None
 
 

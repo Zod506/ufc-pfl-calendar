@@ -63,7 +63,7 @@ jobs:
           base: main
           delete-branch: false
           labels: automation
-          path: output/calendar.ics
+          add-paths: output/calendar.ics
           signoff: true
 
       - name: Upload Pages artifact

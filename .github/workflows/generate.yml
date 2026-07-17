@@ -66,7 +66,8 @@ jobs:
           git commit -m "chore: update generated calendar"
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
           BRANCH="generated/calendar-${SHORT_SHA}"
-          git branch -M "$BRANCH"
+          # create a branch at current HEAD (handles detached HEAD from checkout)
+          git checkout -b "$BRANCH"
           # push branch using token
           git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
           git push -u origin "$BRANCH"

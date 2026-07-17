@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from datetime import date, datetime, timezone
 
 from bs4 import BeautifulSoup
 
@@ -8,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import ufc
+from models import FightEvent
 
 
 def test_normalize_watch_event_short():
@@ -39,3 +41,33 @@ def test_fetch_watch_schedule_parses_eest_and_fight_night(monkeypatch):
 
     fn_key = next(k for k in out.keys() if k[0] == "UFC FIGHT NIGHT")
     assert out[fn_key]["main_card"] is not None
+
+
+def test_get_ufc_events_falls_back_to_public_listing(monkeypatch):
+    monkeypatch.setattr(ufc, "_get_api_key", lambda: None)
+    monkeypatch.setattr(ufc, "_fetch_ufc_watch_schedule", lambda: {})
+
+    def fake_listing():
+        return {
+            (("sean", "omalley"), ("merab", "dvalishvili")): {
+                "event_name": "UFC 329",
+                "main_event": "Sean O'Malley vs Merab Dvalishvili",
+                "url": "https://www.ufc.com/event/ufc-329",
+                "event_date": date(2026, 7, 20),
+                "venue": "The Sphere\nLas Vegas, NV, USA",
+                "times": {
+                    "early_prelims": datetime(2026, 6, 6, 13, 0, tzinfo=timezone.utc),
+                    "prelims": datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc),
+                    "main_card": datetime(2026, 6, 6, 18, 0, tzinfo=timezone.utc),
+                },
+            }
+        }
+
+    monkeypatch.setattr(ufc, "_fetch_ufc_events_listing_index", fake_listing)
+
+    events = ufc.get_ufc_events()
+
+    assert len(events) == 1
+    assert events[0].organization == "UFC"
+    assert events[0].event_name == "UFC 329"
+    assert events[0].main_event == "Sean O'Malley vs Merab Dvalishvili"

@@ -680,7 +680,10 @@ def _fetch_ufc_events_listing_index() -> Dict[tuple[str, str], Dict[str, Any]]:
                     times["main_card"] = val
 
         entry = {
+            "event_name": _normalize_text(headline) or _normalize_text(link.get_text(" ", strip=True)) or "UFC Event",
+            "main_event": mm,
             "url": url,
+            "event_date": event_date,
             "venue": _extract_listing_venue(article),
             "times": times,
         }
@@ -1085,10 +1088,70 @@ def _is_future_event(event: FightEvent) -> bool:
     return False
 
 
+def _build_public_ufc_events(
+    listing_index: Dict[tuple[str, str], Dict[str, Any]],
+    watch_schedule: Optional[Dict[Tuple[str, date], Dict[str, Optional[datetime]]]] = None,
+) -> List[FightEvent]:
+    """Build UFC events from the public UFC events listing when API access is unavailable."""
+    events: List[FightEvent] = []
+    today = datetime.now(RIYADH).date()
+
+    for entry in listing_index.values():
+        event_name = _normalize_text(entry.get("event_name")) or "UFC Event"
+        main_event = _normalize_text(entry.get("main_event"))
+        event_date = entry.get("event_date")
+        if event_date is None:
+            continue
+        if event_date < today:
+            continue
+
+        times = entry.get("times") or {}
+        early_prelims = times.get("early_prelims")
+        prelims = times.get("prelims")
+        main_card = times.get("main_card")
+
+        if watch_schedule:
+            ws_key = _watch_schedule_key(event_name, event_date)
+            if ws_key and ws_key in watch_schedule:
+                ws = watch_schedule[ws_key]
+                if ws.get("early_prelims") is not None:
+                    early_prelims = ws.get("early_prelims")
+                if ws.get("prelims") is not None:
+                    prelims = ws.get("prelims")
+                if ws.get("main_card") is not None:
+                    main_card = ws.get("main_card")
+
+        if prelims and main_card and prelims > main_card:
+            prelims = None
+        if prelims and main_card and prelims == main_card:
+            prelims = None
+
+        events.append(
+            FightEvent(
+                organization="UFC",
+                event_name=event_name,
+                slug=event_name.lower().replace(" ", "-") if event_name else "ufc-event",
+                main_event=main_event,
+                fight_list=None,
+                location=entry.get("venue"),
+                event_date=event_date,
+                early_prelims=early_prelims,
+                prelims=prelims,
+                main_card=main_card,
+                source_url=entry.get("url"),
+            )
+        )
+
+    return sorted(events, key=lambda ev: ev.main_card or datetime.combine(ev.event_date, datetime.min.time(), tzinfo=RIYADH))
+
+
 def get_ufc_events() -> List[FightEvent]:
     api_key = _get_api_key()
+    watch_schedule = _fetch_ufc_watch_schedule()
+    listing_index = _fetch_ufc_events_listing_index()
+
     if not api_key:
-        return []
+        return _build_public_ufc_events(listing_index, watch_schedule)
 
     headers = _build_headers(api_key)
     now = datetime.now(RIYADH)
@@ -1096,10 +1159,6 @@ def get_ufc_events() -> List[FightEvent]:
     next_year = current_year + 1
     event_ids: set[str] = set()
     events: List[FightEvent] = []
-
-    # Pre-fetch the UFC watch/schedule page once for card-segment timing.
-    watch_schedule = _fetch_ufc_watch_schedule()
-    listing_index = _fetch_ufc_events_listing_index()
 
     for season in (current_year, next_year):
         url = f"{SCHEDULE_ENDPOINT}/{season}"
@@ -1122,5 +1181,9 @@ def get_ufc_events() -> List[FightEvent]:
 
             event_ids.add(event_id)
             events.append(event)
+
+    if not events:
+        logger.info("SportsDataIO returned no UFC events; falling back to public UFC listing")
+        return _build_public_ufc_events(listing_index, watch_schedule)
 
     return sorted(events, key=lambda ev: ev.main_card or datetime.combine(ev.event_date, datetime.min.time(), tzinfo=RIYADH))

@@ -14,13 +14,16 @@ permissions:
 
 jobs:
   build:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # allow pushing back using the provided GITHUB_TOKEN
+          # explicitly provide the token and persist credentials so pushes work
+          token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
       - name: Setup Python
@@ -59,7 +62,9 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "chore: update generated calendar"
-            git push
+            # ensure push uses the GITHUB_TOKEN explicitly (helps when repo settings require auth)
+            git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git
+            git push origin HEAD
           fi
 
       - name: Upload Pages artifact

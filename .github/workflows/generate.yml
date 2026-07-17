@@ -8,7 +8,7 @@ on:
     - cron: "0 */6 * * *"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -19,6 +19,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # allow pushing back using the provided GITHUB_TOKEN
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -43,6 +46,21 @@ jobs:
         run: |
           mkdir site
           cp output/calendar.ics site/calendar.ics
+
+      - name: Commit and push calendar
+        if: ${{ always() }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/calendar.ics
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update generated calendar"
+            git push
+          fi
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
